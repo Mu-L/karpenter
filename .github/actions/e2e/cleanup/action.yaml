@@ -15,70 +15,38 @@ inputs:
     required: true
   git_ref:
     description: "The git commit, tag, or branch to check out. Requires a corresponding Karpenter snapshot release"
+  eksctl_version:
+    description: "Version of eksctl to install"
+    default: v0.202.0
+  private_cluster:
+    description: "Whether the cluster that has to be deleted is private or not. Valid values are 'true' or 'false'"
+    default: 'false'
 runs:
   using: "composite"
   steps:
-    - name: configure aws credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        role-to-assume: arn:aws:iam::${{ inputs.account_id }}:role/${{ inputs.role }}
-        aws-region: ${{ inputs.region }}
-        role-duration-seconds: 21600
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       with:
         ref: ${{ inputs.git_ref }}
     - uses: ./.github/actions/e2e/install-eksctl
       with:
-        eksctl_version: v0.147.0
-    - name: delete-instance-profiles
-      shell:
-      run: |
-        for name in $(aws iam list-instance-profiles --query "InstanceProfiles[*].{Name:InstanceProfileName}" --output text); do
-          tags=$(aws iam list-instance-profile-tags --instance-profile-name $name --output json || true)
-          if [[ $(echo $tags | jq -r '.Tags[] | select(.Key == "testing.karpenter.sh/cluster") | .Value') == "${{ inputs.cluster_name }}" ]]; then 
-              roleName=$(aws iam get-instance-profile --instance-profile-name $name --query "InstanceProfile.Roles[*].{Name:RoleName}" --output text)
-              aws iam remove-role-from-instance-profile --instance-profile-name $name --role-name $roleName
-              aws iam delete-instance-profile --instance-profile-name $name
-              break
-          fi
-        done
-    - name: delete-security-group
-      shell: bash
-      # For drift testing, we create a security group and need to clean it up here 
-      # to avoid leaks if the tests is not fully completed
-      run: | 
-        aws ec2 describe-security-groups \
-          --filters Name=group-name,Values=security-group-drift Name=tag:karpenter.sh/discovery,Values=${{ inputs.cluster_name }} \
-          --query "SecurityGroups[*].{ID:GroupId}" \
-          --output text |
-        xargs \
-          -n 1 \
-          -r \
-          aws ec2 delete-security-group \
-            --group-id
+        version: ${{ inputs.eksctl_version }}
     - name: delete-cluster
+      if: ${{ inputs.private_cluster == 'false' }}
       shell: bash
+      env:
+        CLUSTER_NAME: ${{ inputs.cluster_name }}
       run: |
-        eksctl delete cluster --name ${{ inputs.cluster_name }} --timeout 60m --wait || true
-    - name: delete-iam-policies-stack
+        eksctl delete cluster --name "$CLUSTER_NAME" --timeout 60m --wait || true
+    - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+      with:
+        go-version-file: test/hack/resource/go.mod
+        cache-dependency-path: test/hack/resource/go.sum
+        check-latest: true
+        cache: false
+    - name: "Run cleanup script"
       shell: bash
+      env:
+        CLUSTER_NAME: ${{ inputs.cluster_name }}
       run: |
-        aws cloudformation delete-stack --stack-name iam-${{ inputs.cluster_name }}
-        aws cloudformation wait stack-delete-complete --stack-name iam-${{ inputs.cluster_name }}
-    - name: delete-cluster-stack
-      shell: bash
-      run: |
-        aws cloudformation delete-stack --stack-name eksctl-${{ inputs.cluster_name }}-cluster || true
-        aws cloudformation wait stack-delete-complete --stack-name eksctl-${{ inputs.cluster_name }}-cluster || true
-    - name: delete-launch-templates
-      shell: bash
-      run: |
-        aws ec2 describe-launch-templates \
-          --filter Name=tag:karpenter.k8s.aws/cluster,Values=${{ inputs.cluster_name }} \
-          --query "LaunchTemplates[*].LaunchTemplateId" \
-          --output text |
-        xargs \
-          -n 1 \
-          -r \
-          aws ec2 delete-launch-template \
-            --launch-template-id
+        go run main.go --cluster-name "$CLUSTER_NAME"
+      working-directory: ./test/hack/resource/clean

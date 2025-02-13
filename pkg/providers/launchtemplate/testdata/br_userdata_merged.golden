@@ -9,13 +9,15 @@ max-pods = 110
 
 [settings.kubernetes.node-labels]
 custom-node-label = 'custom'
+'karpenter.k8s.aws/ec2nodeclass' = '%s'
 'karpenter.sh/capacity-type' = 'on-demand'
-'karpenter.sh/provisioner-name' = '%s'
-'testing.karpenter.sh/cluster' = 'unspecified'
+'%s' = '%s'
+'testing/cluster' = 'unspecified'
 
 [settings.kubernetes.node-taints]
 baz = ['bin:NoExecute']
 foo = ['bar:NoExecute']
+'karpenter.sh/unregistered' = [':NoExecute']
 
 [settings.kubernetes.eviction-hard]
 'memory.available' = '12%%'

@@ -19,187 +19,228 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	stdlog "log"
 	"net"
-	"time"
+	"os"
+	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	awsclient "github.com/aws/aws-sdk-go/aws/client"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	"github.com/aws/aws-sdk-go/aws/ec2metadata"
-	"github.com/aws/aws-sdk-go/aws/endpoints"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
-	"github.com/aws/aws-sdk-go/service/eks"
-	"github.com/aws/aws-sdk-go/service/eks/eksiface"
-	"github.com/aws/aws-sdk-go/service/ssm"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/middleware"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/eks"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+
+	"github.com/aws/smithy-go"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
-	"knative.dev/pkg/logging"
-	"knative.dev/pkg/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	clinetconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/aws/karpenter-core/pkg/operator"
-	"github.com/aws/karpenter/pkg/apis/settings"
-	awscache "github.com/aws/karpenter/pkg/cache"
-	"github.com/aws/karpenter/pkg/providers/amifamily"
-	"github.com/aws/karpenter/pkg/providers/instance"
-	"github.com/aws/karpenter/pkg/providers/instancetype"
-	"github.com/aws/karpenter/pkg/providers/launchtemplate"
-	"github.com/aws/karpenter/pkg/providers/pricing"
-	"github.com/aws/karpenter/pkg/providers/securitygroup"
-	"github.com/aws/karpenter/pkg/providers/subnet"
-	"github.com/aws/karpenter/pkg/utils/project"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/operator"
+
+	prometheusv2 "github.com/jonathan-innis/aws-sdk-go-prometheus/v2"
+
+	"sigs.k8s.io/karpenter/pkg/apis"
+
+	sdk "github.com/aws/karpenter-provider-aws/pkg/aws"
+	awscache "github.com/aws/karpenter-provider-aws/pkg/cache"
+	"github.com/aws/karpenter-provider-aws/pkg/operator/options"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/amifamily"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/instance"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/instanceprofile"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/instancetype"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/launchtemplate"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/pricing"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/securitygroup"
+	ssmp "github.com/aws/karpenter-provider-aws/pkg/providers/ssm"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/subnet"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/version"
+	"github.com/aws/karpenter-provider-aws/pkg/utils"
 )
+
+func init() {
+	karpv1.NormalizedLabels = lo.Assign(karpv1.NormalizedLabels, map[string]string{"topology.ebs.csi.aws.com/zone": corev1.LabelTopologyZone})
+}
 
 // Operator is injected into the AWS CloudProvider's factories
 type Operator struct {
 	*operator.Operator
-
-	Session                   *session.Session
+	Config                    aws.Config
 	UnavailableOfferingsCache *awscache.UnavailableOfferings
-	EC2API                    ec2iface.EC2API
-	SubnetProvider            *subnet.Provider
-	SecurityGroupProvider     *securitygroup.Provider
-	AMIProvider               *amifamily.Provider
-	AMIResolver               *amifamily.Resolver
-	LaunchTemplateProvider    *launchtemplate.Provider
-	PricingProvider           *pricing.Provider
-	InstanceTypesProvider     *instancetype.Provider
-	InstanceProvider          *instance.Provider
+	SSMCache                  *cache.Cache
+	SubnetProvider            subnet.Provider
+	SecurityGroupProvider     securitygroup.Provider
+	InstanceProfileProvider   instanceprofile.Provider
+	AMIProvider               amifamily.Provider
+	AMIResolver               amifamily.Resolver
+	LaunchTemplateProvider    launchtemplate.Provider
+	PricingProvider           pricing.Provider
+	VersionProvider           *version.DefaultProvider
+	InstanceTypesProvider     *instancetype.DefaultProvider
+	InstanceProvider          instance.Provider
+	SSMProvider               ssmp.Provider
+	EC2API                    *ec2.Client
 }
 
 func NewOperator(ctx context.Context, operator *operator.Operator) (context.Context, *Operator) {
-	config := &aws.Config{
-		STSRegionalEndpoint: endpoints.RegionalSTSEndpoint,
+	kubeletCompatibilityAnnotationKey := fmt.Sprintf("%s/%s", apis.CompatibilityGroup, "v1beta1-kubelet-conversion")
+	// we are going to panic if any of the customer nodepools contain
+	// compatibility.karpenter.sh/v1beta1-kubelet-conversion
+	restConfig := clinetconfig.GetConfigOrDie()
+	kubeClient := lo.Must(client.New(restConfig, client.Options{}))
+	nodePoolList := &karpv1.NodePoolList{}
+	lo.Must0(kubeClient.List(ctx, nodePoolList))
+	npNames := lo.FilterMap(nodePoolList.Items, func(np karpv1.NodePool, _ int) (string, bool) {
+		_, ok := np.Annotations[kubeletCompatibilityAnnotationKey]
+		return np.Name, ok
+	})
+	if len(npNames) != 0 {
+		stdlog.Fatalf("The kubelet compatibility annotation, %s, is not supported on Karpenter v1.1+. Please refer to the upgrade guide in the docs. The following NodePools still have the compatibility annotation: %s", kubeletCompatibilityAnnotationKey, strings.Join(npNames, ", "))
 	}
 
-	if assumeRoleARN := settings.FromContext(ctx).AssumeRoleARN; assumeRoleARN != "" {
-		config.Credentials = stscreds.NewCredentials(session.Must(session.NewSession()), assumeRoleARN,
-			func(provider *stscreds.AssumeRoleProvider) { setDurationAndExpiry(ctx, provider) })
+	cfg := prometheusv2.WithPrometheusMetrics(WithUserAgent(lo.Must(config.LoadDefaultConfig(ctx))), crmetrics.Registry)
+	if cfg.Region == "" {
+		log.FromContext(ctx).V(1).Info("retrieving region from IMDS")
+		region := lo.Must(imds.NewFromConfig(cfg).GetRegion(ctx, nil))
+		cfg.Region = region.Region
 	}
-
-	sess := withUserAgent(session.Must(session.NewSession(
-		request.WithRetryer(
-			config,
-			awsclient.DefaultRetryer{NumMaxRetries: awsclient.DefaultRetryerMaxNumRetries},
-		),
-	)))
-
-	if *sess.Config.Region == "" {
-		logging.FromContext(ctx).Debug("retrieving region from IMDS")
-		region, err := ec2metadata.New(sess).Region()
-		*sess.Config.Region = lo.Must(region, err, "failed to get region from metadata server")
+	ec2api := ec2.NewFromConfig(cfg)
+	eksapi := eks.NewFromConfig(cfg)
+	log.FromContext(ctx).WithValues("region", cfg.Region).V(1).Info("discovered region")
+	if err := CheckEC2Connectivity(ctx, ec2api); err != nil {
+		log.FromContext(ctx).Error(err, "ec2 api connectivity check failed")
+		os.Exit(1)
 	}
-	ec2api := ec2.New(sess)
-	if err := checkEC2Connectivity(ctx, ec2api); err != nil {
-		logging.FromContext(ctx).Fatalf("Checking EC2 API connectivity, %s", err)
-	}
-	logging.FromContext(ctx).With("region", *sess.Config.Region).Debugf("discovered region")
-	clusterEndpoint, err := ResolveClusterEndpoint(ctx, eks.New(sess))
+	log.FromContext(ctx).WithValues("region", cfg.Region).V(1).Info("discovered region")
+	clusterEndpoint, err := ResolveClusterEndpoint(ctx, eksapi)
 	if err != nil {
-		logging.FromContext(ctx).Fatalf("unable to detect the cluster endpoint, %s", err)
+		log.FromContext(ctx).Error(err, "failed detecting cluster endpoint")
+		os.Exit(1)
 	} else {
-		logging.FromContext(ctx).With("cluster-endpoint", clusterEndpoint).Debugf("discovered cluster endpoint")
+		log.FromContext(ctx).WithValues("cluster-endpoint", clusterEndpoint).V(1).Info("discovered cluster endpoint")
 	}
-	// We perform best-effort on resolving the kube-dns IP
-	kubeDNSIP, err := kubeDNSIP(ctx, operator.KubernetesInterface)
+	kubeDNSIP, err := KubeDNSIP(ctx, operator.KubernetesInterface)
 	if err != nil {
 		// If we fail to get the kube-dns IP, we don't want to crash because this causes issues with custom DNS setups
-		// https://github.com/aws/karpenter/issues/2787
-		logging.FromContext(ctx).Debugf("unable to detect the IP of the kube-dns service, %s", err)
+		// https://github.com/aws/karpenter-provider-aws/issues/2787
+		log.FromContext(ctx).V(1).Info(fmt.Sprintf("unable to detect the IP of the kube-dns service, %s", err))
 	} else {
-		logging.FromContext(ctx).With("kube-dns-ip", kubeDNSIP).Debugf("discovered kube dns")
+		log.FromContext(ctx).WithValues("kube-dns-ip", kubeDNSIP).V(1).Info("discovered kube dns")
 	}
-
 	unavailableOfferingsCache := awscache.NewUnavailableOfferings()
-	subnetProvider := subnet.NewProvider(ec2api, cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval))
-	securityGroupProvider := securitygroup.NewProvider(ec2api, cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval))
-	pricingProvider := pricing.NewProvider(
+	ssmCache := cache.New(awscache.SSMCacheTTL, awscache.DefaultCleanupInterval)
+
+	subnetProvider := subnet.NewDefaultProvider(ec2api, cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval), cache.New(awscache.AvailableIPAddressTTL, awscache.DefaultCleanupInterval), cache.New(awscache.AssociatePublicIPAddressTTL, awscache.DefaultCleanupInterval))
+	securityGroupProvider := securitygroup.NewDefaultProvider(ec2api, cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval))
+	instanceProfileProvider := instanceprofile.NewDefaultProvider(cfg.Region, iam.NewFromConfig(cfg), cache.New(awscache.InstanceProfileTTL, awscache.DefaultCleanupInterval))
+	pricingProvider := pricing.NewDefaultProvider(
 		ctx,
-		pricing.NewAPI(sess, *sess.Config.Region),
+		pricing.NewAPI(cfg),
 		ec2api,
-		*sess.Config.Region,
+		cfg.Region,
 	)
-	amiProvider := amifamily.NewProvider(operator.GetClient(), operator.KubernetesInterface, ssm.New(sess), ec2api,
-		cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval), cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval), cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval))
-	amiResolver := amifamily.New(amiProvider)
-	launchTemplateProvider := launchtemplate.NewProvider(
+	versionProvider := version.NewDefaultProvider(operator.KubernetesInterface, eksapi)
+	// Ensure we're able to hydrate the version before starting any reliant controllers.
+	// Version updates are hydrated asynchronously after this, in the event of a failure
+	// the previously resolved value will be used.
+	lo.Must0(versionProvider.UpdateVersion(ctx))
+	ssmProvider := ssmp.NewDefaultProvider(ssm.NewFromConfig(cfg), ssmCache)
+	amiProvider := amifamily.NewDefaultProvider(operator.Clock, versionProvider, ssmProvider, ec2api, cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval))
+	amiResolver := amifamily.NewDefaultResolver()
+	launchTemplateProvider := launchtemplate.NewDefaultProvider(
 		ctx,
 		cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval),
 		ec2api,
+		eksapi,
 		amiResolver,
 		securityGroupProvider,
 		subnetProvider,
-		lo.Must(getCABundle(ctx, operator.GetConfig())),
+		lo.Must(GetCABundle(ctx, operator.GetConfig())),
 		operator.Elected(),
 		kubeDNSIP,
 		clusterEndpoint,
 	)
-	instanceTypeProvider := instancetype.NewProvider(
-		*sess.Config.Region,
+	instanceTypeProvider := instancetype.NewDefaultProvider(
 		cache.New(awscache.InstanceTypesAndZonesTTL, awscache.DefaultCleanupInterval),
+		cache.New(awscache.DiscoveredCapacityCacheTTL, awscache.DefaultCleanupInterval),
 		ec2api,
 		subnetProvider,
-		unavailableOfferingsCache,
-		pricingProvider,
+		instancetype.NewDefaultResolver(cfg.Region, pricingProvider, unavailableOfferingsCache),
 	)
-	instanceProvider := instance.NewProvider(
+	instanceProvider := instance.NewDefaultProvider(
 		ctx,
-		aws.StringValue(sess.Config.Region),
+		cfg.Region,
 		ec2api,
 		unavailableOfferingsCache,
-		instanceTypeProvider,
 		subnetProvider,
 		launchTemplateProvider,
 	)
 
+	// Setup field indexers on instanceID -- specifically for the interruption controller
+	if options.FromContext(ctx).InterruptionQueue != "" {
+		SetupIndexers(ctx, operator.Manager)
+	}
 	return ctx, &Operator{
 		Operator:                  operator,
-		Session:                   sess,
+		Config:                    cfg,
 		UnavailableOfferingsCache: unavailableOfferingsCache,
-		EC2API:                    ec2api,
+		SSMCache:                  ssmCache,
 		SubnetProvider:            subnetProvider,
 		SecurityGroupProvider:     securityGroupProvider,
+		InstanceProfileProvider:   instanceProfileProvider,
 		AMIProvider:               amiProvider,
 		AMIResolver:               amiResolver,
+		VersionProvider:           versionProvider,
 		LaunchTemplateProvider:    launchTemplateProvider,
 		PricingProvider:           pricingProvider,
 		InstanceTypesProvider:     instanceTypeProvider,
 		InstanceProvider:          instanceProvider,
+		SSMProvider:               ssmProvider,
+		EC2API:                    ec2api,
 	}
 }
 
-// withUserAgent adds a karpenter specific user-agent string to AWS session
-func withUserAgent(sess *session.Session) *session.Session {
-	userAgent := fmt.Sprintf("karpenter.sh-%s", project.Version)
-	sess.Handlers.Build.PushBack(request.MakeAddToUserAgentFreeFormHandler(userAgent))
-	return sess
+// WithUserAgent adds a karpenter specific user-agent string to AWS session
+func WithUserAgent(cfg aws.Config) aws.Config {
+	userAgent := fmt.Sprintf("karpenter.sh-%s", operator.Version)
+	cfg.APIOptions = append(cfg.APIOptions,
+		middleware.AddUserAgentKey(userAgent),
+	)
+	return cfg
 }
 
-// checkEC2Connectivity makes a dry-run call to DescribeInstanceTypes.  If it fails, we provide an early indicator that we
+// CheckEC2Connectivity makes a dry-run call to DescribeInstanceTypes.  If it fails, we provide an early indicator that we
 // are having issues connecting to the EC2 API.
-func checkEC2Connectivity(ctx context.Context, api *ec2.EC2) error {
-	_, err := api.DescribeInstanceTypesWithContext(ctx, &ec2.DescribeInstanceTypesInput{DryRun: aws.Bool(true)})
-	var aerr awserr.Error
-	if errors.As(err, &aerr) && aerr.Code() == "DryRunOperation" {
+func CheckEC2Connectivity(ctx context.Context, api sdk.EC2API) error {
+	_, err := api.DescribeInstanceTypes(ctx, &ec2.DescribeInstanceTypesInput{
+		DryRun: aws.Bool(true),
+	})
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "DryRunOperation" {
 		return nil
 	}
 	return err
 }
 
-func ResolveClusterEndpoint(ctx context.Context, eksAPI eksiface.EKSAPI) (string, error) {
-	clusterEndpointFromSettings := settings.FromContext(ctx).ClusterEndpoint
-	if clusterEndpointFromSettings != "" {
-		return clusterEndpointFromSettings, nil // cluster endpoint is explicitly set
+func ResolveClusterEndpoint(ctx context.Context, eksAPI sdk.EKSAPI) (string, error) {
+	clusterEndpointFromOptions := options.FromContext(ctx).ClusterEndpoint
+	if clusterEndpointFromOptions != "" {
+		return clusterEndpointFromOptions, nil // cluster endpoint is explicitly set
 	}
-	out, err := eksAPI.DescribeCluster(&eks.DescribeClusterInput{
-		Name: aws.String(settings.FromContext(ctx).ClusterName),
+	out, err := eksAPI.DescribeCluster(ctx, &eks.DescribeClusterInput{
+		Name: aws.String(options.FromContext(ctx).ClusterName),
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve cluster endpoint, %w", err)
@@ -207,12 +248,12 @@ func ResolveClusterEndpoint(ctx context.Context, eksAPI eksiface.EKSAPI) (string
 	return *out.Cluster.Endpoint, nil
 }
 
-func getCABundle(ctx context.Context, restConfig *rest.Config) (*string, error) {
+func GetCABundle(ctx context.Context, restConfig *rest.Config) (*string, error) {
 	// Discover CA Bundle from the REST client. We could alternatively
 	// have used the simpler client-go InClusterConfig() method.
 	// However, that only works when Karpenter is running as a Pod
 	// within the same cluster it's managing.
-	if caBundle := settings.FromContext(ctx).ClusterCABundle; caBundle != "" {
+	if caBundle := options.FromContext(ctx).ClusterCABundle; caBundle != "" {
 		return lo.ToPtr(caBundle), nil
 	}
 	transportConfig, err := restConfig.TransportConfig()
@@ -223,10 +264,10 @@ func getCABundle(ctx context.Context, restConfig *rest.Config) (*string, error) 
 	if err != nil {
 		return nil, fmt.Errorf("discovering caBundle, loading TLS config, %w", err)
 	}
-	return ptr.String(base64.StdEncoding.EncodeToString(transportConfig.TLS.CAData)), nil
+	return lo.ToPtr(base64.StdEncoding.EncodeToString(transportConfig.TLS.CAData)), nil
 }
 
-func kubeDNSIP(ctx context.Context, kubernetesInterface kubernetes.Interface) (net.IP, error) {
+func KubeDNSIP(ctx context.Context, kubernetesInterface kubernetes.Interface) (net.IP, error) {
 	if kubernetesInterface == nil {
 		return nil, fmt.Errorf("no K8s client provided")
 	}
@@ -241,7 +282,25 @@ func kubeDNSIP(ctx context.Context, kubernetesInterface kubernetes.Interface) (n
 	return kubeDNSIP, nil
 }
 
-func setDurationAndExpiry(ctx context.Context, provider *stscreds.AssumeRoleProvider) {
-	provider.Duration = settings.FromContext(ctx).AssumeRoleDuration
-	provider.ExpiryWindow = time.Duration(10) * time.Second
+func SetupIndexers(ctx context.Context, mgr manager.Manager) {
+	lo.Must0(mgr.GetFieldIndexer().IndexField(ctx, &karpv1.NodeClaim{}, "status.instanceID", func(o client.Object) []string {
+		if o.(*karpv1.NodeClaim).Status.ProviderID == "" {
+			return nil
+		}
+		id, e := utils.ParseInstanceID(o.(*karpv1.NodeClaim).Status.ProviderID)
+		if e != nil || id == "" {
+			return nil
+		}
+		return []string{id}
+	}), "failed to setup nodeclaim instanceID indexer")
+	lo.Must0(mgr.GetFieldIndexer().IndexField(ctx, &corev1.Node{}, "spec.instanceID", func(o client.Object) []string {
+		if o.(*corev1.Node).Spec.ProviderID == "" {
+			return nil
+		}
+		id, e := utils.ParseInstanceID(o.(*corev1.Node).Spec.ProviderID)
+		if e != nil || id == "" {
+			return nil
+		}
+		return []string{id}
+	}), "failed to setup node instanceID indexer")
 }

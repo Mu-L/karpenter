@@ -18,171 +18,134 @@ import (
 	"math"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"knative.dev/pkg/ptr"
 
-	"github.com/aws/karpenter-core/pkg/apis/v1alpha5"
-	"github.com/aws/karpenter/pkg/apis/settings"
-	awstest "github.com/aws/karpenter/pkg/test"
-	"github.com/aws/karpenter/test/pkg/environment/aws"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
-	"github.com/aws/karpenter-core/pkg/test"
-	"github.com/aws/karpenter/pkg/apis/v1alpha1"
+	"github.com/samber/lo"
+
+	"github.com/aws/karpenter-provider-aws/test/pkg/environment/aws"
+
+	"sigs.k8s.io/karpenter/pkg/test"
+
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
+
+	. "github.com/onsi/ginkgo/v2"
 )
 
 var _ = Describe("KubeletConfiguration Overrides", func() {
 	Context("All kubelet configuration set", func() {
-		var nodeTemplate *v1alpha1.AWSNodeTemplate
-		var provisioner *v1alpha5.Provisioner
-
 		BeforeEach(func() {
-			nodeTemplate = awstest.AWSNodeTemplate(v1alpha1.AWSNodeTemplateSpec{AWS: v1alpha1.AWS{
-				SecurityGroupSelector: map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-				SubnetSelector:        map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-			}})
-
 			// MaxPods needs to account for the daemonsets that will run on the nodes
-			provisioner = test.Provisioner(test.ProvisionerOptions{
-				ProviderRef: &v1alpha5.MachineTemplateRef{Name: nodeTemplate.Name},
-				Kubelet: &v1alpha5.KubeletConfiguration{
-					ContainerRuntime: ptr.String("containerd"),
-					MaxPods:          ptr.Int32(110),
-					PodsPerCore:      ptr.Int32(10),
-					SystemReserved: v1.ResourceList{
-						v1.ResourceCPU:              resource.MustParse("200m"),
-						v1.ResourceMemory:           resource.MustParse("200Mi"),
-						v1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
-					},
-					KubeReserved: v1.ResourceList{
-						v1.ResourceCPU:              resource.MustParse("200m"),
-						v1.ResourceMemory:           resource.MustParse("200Mi"),
-						v1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
-					},
-					EvictionHard: map[string]string{
-						"memory.available":   "5%",
-						"nodefs.available":   "5%",
-						"nodefs.inodesFree":  "5%",
-						"imagefs.available":  "5%",
-						"imagefs.inodesFree": "5%",
-						"pid.available":      "3%",
-					},
-					EvictionSoft: map[string]string{
-						"memory.available":   "10%",
-						"nodefs.available":   "10%",
-						"nodefs.inodesFree":  "10%",
-						"imagefs.available":  "10%",
-						"imagefs.inodesFree": "10%",
-						"pid.available":      "6%",
-					},
-					EvictionSoftGracePeriod: map[string]metav1.Duration{
-						"memory.available":   {Duration: time.Minute * 2},
-						"nodefs.available":   {Duration: time.Minute * 2},
-						"nodefs.inodesFree":  {Duration: time.Minute * 2},
-						"imagefs.available":  {Duration: time.Minute * 2},
-						"imagefs.inodesFree": {Duration: time.Minute * 2},
-						"pid.available":      {Duration: time.Minute * 2},
-					},
-					EvictionMaxPodGracePeriod:   ptr.Int32(120),
-					ImageGCHighThresholdPercent: ptr.Int32(50),
-					ImageGCLowThresholdPercent:  ptr.Int32(10),
-					CPUCFSQuota:                 ptr.Bool(false),
+			nodeClass.Spec.Kubelet = &v1.KubeletConfiguration{
+				MaxPods:     lo.ToPtr(int32(110)),
+				PodsPerCore: lo.ToPtr(int32(10)),
+				SystemReserved: map[string]string{
+					string(corev1.ResourceCPU):              "200m",
+					string(corev1.ResourceMemory):           "200Mi",
+					string(corev1.ResourceEphemeralStorage): "1Gi",
 				},
-			})
+				KubeReserved: map[string]string{
+					string(corev1.ResourceCPU):              "200m",
+					string(corev1.ResourceMemory):           "200Mi",
+					string(corev1.ResourceEphemeralStorage): "1Gi",
+				},
+				EvictionHard: map[string]string{
+					"memory.available":   "5%",
+					"nodefs.available":   "5%",
+					"nodefs.inodesFree":  "5%",
+					"imagefs.available":  "5%",
+					"imagefs.inodesFree": "5%",
+					"pid.available":      "3%",
+				},
+				EvictionSoft: map[string]string{
+					"memory.available":   "10%",
+					"nodefs.available":   "10%",
+					"nodefs.inodesFree":  "10%",
+					"imagefs.available":  "10%",
+					"imagefs.inodesFree": "10%",
+					"pid.available":      "6%",
+				},
+				EvictionSoftGracePeriod: map[string]metav1.Duration{
+					"memory.available":   {Duration: time.Minute * 2},
+					"nodefs.available":   {Duration: time.Minute * 2},
+					"nodefs.inodesFree":  {Duration: time.Minute * 2},
+					"imagefs.available":  {Duration: time.Minute * 2},
+					"imagefs.inodesFree": {Duration: time.Minute * 2},
+					"pid.available":      {Duration: time.Minute * 2},
+				},
+				EvictionMaxPodGracePeriod:   lo.ToPtr(int32(120)),
+				ImageGCHighThresholdPercent: lo.ToPtr(int32(50)),
+				ImageGCLowThresholdPercent:  lo.ToPtr(int32(10)),
+				CPUCFSQuota:                 lo.ToPtr(false),
+			}
 		})
 		DescribeTable("Linux AMIFamilies",
-			func(amiFamily *string) {
-				nodeTemplate.Spec.AMIFamily = amiFamily
-				// Need to enable provisioner-level OS-scoping for now since DS evaluation is done off of the provisioner
-				// requirements, not off of the instance type options so scheduling can fail if provisioners aren't
-				// properly scoped
-				provisioner.Spec.Requirements = append(provisioner.Spec.Requirements, v1.NodeSelectorRequirement{
-					Key:      v1.LabelOSStable,
-					Operator: v1.NodeSelectorOpIn,
-					Values:   []string{string(v1.Linux)},
-				},
-					// TODO: remove this requirement once VPC RC rolls out m7a.* ENI data (https://github.com/aws/karpenter/issues/4472)
-					v1.NodeSelectorRequirement{
-						Key:      v1alpha1.LabelInstanceFamily,
-						Operator: v1.NodeSelectorOpNotIn,
-						Values:   []string{"m7a"},
-					})
+			func(term v1.AMISelectorTerm) {
+				nodeClass.Spec.AMISelectorTerms = []v1.AMISelectorTerm{term}
+				// TODO (jmdeal@): remove once 22.04 AMIs are supported
 				pod := test.Pod(test.PodOptions{
 					NodeSelector: map[string]string{
-						v1.LabelOSStable:   string(v1.Linux),
-						v1.LabelArchStable: "amd64",
+						corev1.LabelOSStable:   string(corev1.Linux),
+						corev1.LabelArchStable: "amd64",
 					},
 				})
-				env.ExpectCreated(provisioner, nodeTemplate, pod)
+				env.ExpectCreated(nodeClass, nodePool, pod)
 				env.EventuallyExpectHealthy(pod)
 				env.ExpectCreatedNodeCount("==", 1)
 			},
-			Entry("when the AMIFamily is AL2", &v1alpha1.AMIFamilyAL2),
-			Entry("when the AMIFamily is Ubuntu", &v1alpha1.AMIFamilyUbuntu),
-			Entry("when the AMIFamily is Bottlerocket", &v1alpha1.AMIFamilyBottlerocket),
+			Entry("when the AMIFamily is AL2", v1.AMISelectorTerm{Alias: "al2@latest"}),
+			Entry("when the AMIFamily is AL2023", v1.AMISelectorTerm{Alias: "al2023@latest"}),
+			Entry("when the AMIFamily is Bottlerocket", v1.AMISelectorTerm{Alias: "bottlerocket@latest"}),
 		)
 		DescribeTable("Windows AMIFamilies",
-			func(amiFamily *string) {
+			func(term v1.AMISelectorTerm) {
 				env.ExpectWindowsIPAMEnabled()
 				DeferCleanup(func() {
 					env.ExpectWindowsIPAMDisabled()
 				})
 
-				nodeTemplate.Spec.AMIFamily = amiFamily
-				// Need to enable provisioner-level OS-scoping for now since DS evaluation is done off of the provisioner
-				// requirements, not off of the instance type options so scheduling can fail if provisioners aren't
+				nodeClass.Spec.AMISelectorTerms = []v1.AMISelectorTerm{term}
+				// Need to enable nodepool-level OS-scoping for now since DS evaluation is done off of the nodepool
+				// requirements, not off of the instance type options so scheduling can fail if nodepool aren't
 				// properly scoped
-				provisioner.Spec.Requirements = append(provisioner.Spec.Requirements, v1.NodeSelectorRequirement{
-					Key:      v1.LabelOSStable,
-					Operator: v1.NodeSelectorOpIn,
-					Values:   []string{string(v1.Windows)},
-				},
-					// TODO: remove this requirement once VPC RC rolls out m7a.* ENI data (https://github.com/aws/karpenter/issues/4472)
-					v1.NodeSelectorRequirement{
-						Key:      v1alpha1.LabelInstanceFamily,
-						Operator: v1.NodeSelectorOpNotIn,
-						Values:   []string{"m7a"},
-					})
+				test.ReplaceRequirements(nodePool,
+					karpv1.NodeSelectorRequirementWithMinValues{
+						NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+							Key:      corev1.LabelOSStable,
+							Operator: corev1.NodeSelectorOpIn,
+							Values:   []string{string(corev1.Windows)},
+						},
+					},
+				)
 				pod := test.Pod(test.PodOptions{
 					Image: aws.WindowsDefaultImage,
 					NodeSelector: map[string]string{
-						v1.LabelOSStable:   string(v1.Windows),
-						v1.LabelArchStable: "amd64",
+						corev1.LabelOSStable:   string(corev1.Windows),
+						corev1.LabelArchStable: "amd64",
 					},
 				})
-				env.ExpectCreated(provisioner, nodeTemplate, pod)
+				env.ExpectCreated(nodeClass, nodePool, pod)
 				env.EventuallyExpectHealthyWithTimeout(time.Minute*15, pod)
 				env.ExpectCreatedNodeCount("==", 1)
 			},
-			Entry("when the AMIFamily is Windows2019", &v1alpha1.AMIFamilyWindows2019),
-			Entry("when the AMIFamily is Windows2022", &v1alpha1.AMIFamilyWindows2022),
+			// Windows tests are can flake due to the instance types that are used in testing.
+			// The VPC Resource controller will need to support the instance types that are used.
+			// If the instance type is not supported by the controller resource `vpc.amazonaws.com/PrivateIPv4Address` will not register.
+			// Issue: https://github.com/aws/karpenter-provider-aws/issues/4472
+			// See: https://github.com/aws/amazon-vpc-resource-controller-k8s/blob/master/pkg/aws/vpc/limits.go
+			Entry("when the AMIFamily is Windows2019", v1.AMISelectorTerm{Alias: "windows2019@latest"}),
+			Entry("when the AMIFamily is Windows2022", v1.AMISelectorTerm{Alias: "windows2022@latest"}),
 		)
 	})
 	It("should schedule pods onto separate nodes when maxPods is set", func() {
-		provider := awstest.AWSNodeTemplate(v1alpha1.AWSNodeTemplateSpec{AWS: v1alpha1.AWS{
-			SecurityGroupSelector: map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-			SubnetSelector:        map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-		}})
-
-		// MaxPods needs to account for the daemonsets that will run on the nodes
-		provisioner := test.Provisioner(test.ProvisionerOptions{
-			ProviderRef: &v1alpha5.MachineTemplateRef{Name: provider.Name},
-			Requirements: []v1.NodeSelectorRequirement{
-				{
-					Key:      v1.LabelOSStable,
-					Operator: v1.NodeSelectorOpIn,
-					Values:   []string{string(v1.Linux)},
-				},
-			},
-		})
-
 		// Get the DS pod count and use it to calculate the DS pod overhead
-		dsCount := env.GetDaemonSetCount(provisioner)
-		provisioner.Spec.KubeletConfiguration = &v1alpha5.KubeletConfiguration{
-			MaxPods: ptr.Int32(1 + int32(dsCount)),
+		dsCount := env.GetDaemonSetCount(nodePool)
+		nodeClass.Spec.Kubelet = &v1.KubeletConfiguration{
+			MaxPods: lo.ToPtr(1 + int32(dsCount)),
 		}
 
 		numPods := 3
@@ -192,40 +155,30 @@ var _ = Describe("KubeletConfiguration Overrides", func() {
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"app": "large-app"},
 				},
-				ResourceRequirements: v1.ResourceRequirements{
-					Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
 				},
 			},
 		})
 		selector := labels.SelectorFromSet(dep.Spec.Selector.MatchLabels)
-		env.ExpectCreated(provisioner, provider, dep)
+		env.ExpectCreated(nodeClass, nodePool, dep)
 
 		env.EventuallyExpectHealthyPodCount(selector, numPods)
 		env.ExpectCreatedNodeCount("==", 3)
-		env.ExpectUniqueNodeNames(selector, 3)
+		env.EventuallyExpectUniqueNodeNames(selector, 3)
 	})
 	It("should schedule pods onto separate nodes when podsPerCore is set", func() {
-		provider := awstest.AWSNodeTemplate(v1alpha1.AWSNodeTemplateSpec{AWS: v1alpha1.AWS{
-			SecurityGroupSelector: map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-			SubnetSelector:        map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-		}})
 		// PodsPerCore needs to account for the daemonsets that will run on the nodes
 		// This will have 4 pods available on each node (2 taken by daemonset pods)
-		provisioner := test.Provisioner(test.ProvisionerOptions{
-			ProviderRef: &v1alpha5.MachineTemplateRef{Name: provider.Name},
-			Requirements: []v1.NodeSelectorRequirement{
-				{
-					Key:      v1alpha1.LabelInstanceCPU,
-					Operator: v1.NodeSelectorOpIn,
+		test.ReplaceRequirements(nodePool,
+			karpv1.NodeSelectorRequirementWithMinValues{
+				NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+					Key:      v1.LabelInstanceCPU,
+					Operator: corev1.NodeSelectorOpIn,
 					Values:   []string{"2"},
 				},
-				{
-					Key:      v1.LabelOSStable,
-					Operator: v1.NodeSelectorOpIn,
-					Values:   []string{string(v1.Linux)},
-				},
 			},
-		})
+		)
 		numPods := 4
 		dep := test.Deployment(test.DeploymentOptions{
 			Replicas: int32(numPods),
@@ -233,8 +186,8 @@ var _ = Describe("KubeletConfiguration Overrides", func() {
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"app": "large-app"},
 				},
-				ResourceRequirements: v1.ResourceRequirements{
-					Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
 				},
 			},
 		})
@@ -248,37 +201,31 @@ var _ = Describe("KubeletConfiguration Overrides", func() {
 		//   2. If # of DS pods is even, we will have i.e. ceil((4+2)/2) = 3
 		//      Since we restrict node to two cores, we will allow 6 pods. Both nodes will have
 		//      4 DS pods and 2 test pods.
-		dsCount := env.GetDaemonSetCount(provisioner)
-		provisioner.Spec.KubeletConfiguration = &v1alpha5.KubeletConfiguration{
-			PodsPerCore: ptr.Int32(int32(math.Ceil(float64(2+dsCount) / 2))),
+		dsCount := env.GetDaemonSetCount(nodePool)
+		nodeClass.Spec.Kubelet = &v1.KubeletConfiguration{
+			PodsPerCore: lo.ToPtr(int32(math.Ceil(float64(2+dsCount) / 2))),
 		}
 
-		env.ExpectCreated(provisioner, provider, dep)
+		env.ExpectCreated(nodeClass, nodePool, dep)
 		env.EventuallyExpectHealthyPodCount(selector, numPods)
 		env.ExpectCreatedNodeCount("==", 2)
-		env.ExpectUniqueNodeNames(selector, 2)
+		env.EventuallyExpectUniqueNodeNames(selector, 2)
 	})
 	It("should ignore podsPerCore value when Bottlerocket is used", func() {
-		provider := awstest.AWSNodeTemplate(v1alpha1.AWSNodeTemplateSpec{AWS: v1alpha1.AWS{
-			SecurityGroupSelector: map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-			SubnetSelector:        map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-			AMIFamily:             &v1alpha1.AMIFamilyBottlerocket,
-		}})
+		nodeClass.Spec.AMISelectorTerms = []v1.AMISelectorTerm{{Alias: "bottlerocket@latest"}}
 		// All pods should schedule to a single node since we are ignoring podsPerCore value
 		// This would normally schedule to 3 nodes if not using Bottlerocket
-		provisioner := test.Provisioner(test.ProvisionerOptions{
-			ProviderRef: &v1alpha5.MachineTemplateRef{Name: provider.Name},
-			Kubelet: &v1alpha5.KubeletConfiguration{
-				PodsPerCore: ptr.Int32(1),
-			},
-			Requirements: []v1.NodeSelectorRequirement{
-				{
-					Key:      v1alpha1.LabelInstanceCPU,
-					Operator: v1.NodeSelectorOpIn,
+		test.ReplaceRequirements(nodePool,
+			karpv1.NodeSelectorRequirementWithMinValues{
+				NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+					Key:      v1.LabelInstanceCPU,
+					Operator: corev1.NodeSelectorOpIn,
 					Values:   []string{"2"},
 				},
 			},
-		})
+		)
+
+		nodeClass.Spec.Kubelet = &v1.KubeletConfiguration{PodsPerCore: lo.ToPtr(int32(1))}
 		numPods := 6
 		dep := test.Deployment(test.DeploymentOptions{
 			Replicas: int32(numPods),
@@ -286,16 +233,16 @@ var _ = Describe("KubeletConfiguration Overrides", func() {
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"app": "large-app"},
 				},
-				ResourceRequirements: v1.ResourceRequirements{
-					Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
 				},
 			},
 		})
 		selector := labels.SelectorFromSet(dep.Spec.Selector.MatchLabels)
 
-		env.ExpectCreated(provisioner, provider, dep)
+		env.ExpectCreated(nodeClass, nodePool, dep)
 		env.EventuallyExpectHealthyPodCount(selector, numPods)
 		env.ExpectCreatedNodeCount("==", 1)
-		env.ExpectUniqueNodeNames(selector, 1)
+		env.EventuallyExpectUniqueNodeNames(selector, 1)
 	})
 })

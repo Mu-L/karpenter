@@ -28,6 +28,8 @@ import (
 	"strings"
 
 	"github.com/samber/lo"
+
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
 )
 
 type EKS struct {
@@ -66,30 +68,19 @@ func (e EKS) eksBootstrapScript() string {
 	if e.isIPv6() {
 		userData.WriteString(" \\\n--ip-family ipv6")
 	}
-	if e.ContainerRuntime != "" {
-		userData.WriteString(fmt.Sprintf(" \\\n--container-runtime %s", e.ContainerRuntime))
-	}
 	if e.KubeletConfig != nil && len(e.KubeletConfig.ClusterDNS) > 0 {
 		userData.WriteString(fmt.Sprintf(" \\\n--dns-cluster-ip '%s'", e.KubeletConfig.ClusterDNS[0]))
 	}
-	if (e.KubeletConfig != nil && e.KubeletConfig.MaxPods != nil) || !e.AWSENILimitedPodDensity {
+	if e.KubeletConfig != nil && e.KubeletConfig.MaxPods != nil {
 		userData.WriteString(" \\\n--use-max-pods false")
 	}
 	if args := e.kubeletExtraArgs(); len(args) > 0 {
 		userData.WriteString(fmt.Sprintf(" \\\n--kubelet-extra-args '%s'", strings.Join(args, " ")))
 	}
-	return userData.String()
-}
-
-// kubeletExtraArgs for the EKS bootstrap.sh script uses the concept of ENI-limited pod density to set pods
-// If this argument is explicitly disabled, then set the max-pods value on the kubelet to the static value of 110
-func (e EKS) kubeletExtraArgs() []string {
-	args := e.Options.kubeletExtraArgs()
-	// Set the static value for --max-pods to 110 when AWSENILimitedPodDensity is explicitly disabled and the value isn't set
-	if !e.AWSENILimitedPodDensity && (e.KubeletConfig == nil || e.KubeletConfig.MaxPods == nil) {
-		args = append(args, "--max-pods=110")
+	if lo.FromPtr(e.InstanceStorePolicy) == v1.InstanceStorePolicyRAID0 {
+		userData.WriteString(" \\\n--local-disks raid0")
 	}
-	return args
+	return userData.String()
 }
 
 func (e EKS) mergeCustomUserData(userDatas ...string) (string, error) {
@@ -123,7 +114,8 @@ func (e EKS) isIPv6() bool {
 // mimeify returns userData in a mime format
 // if the userData passed in is already in a mime format, then the input is returned without modification
 func (e EKS) mimeify(customUserData string) (string, error) {
-	if strings.HasPrefix(strings.TrimSpace(customUserData), "MIME-Version:") {
+	if strings.HasPrefix(strings.TrimSpace(customUserData), "MIME-Version:") ||
+		strings.HasPrefix(strings.TrimSpace(customUserData), "Content-Type:") {
 		return customUserData, nil
 	}
 	var outputBuffer bytes.Buffer

@@ -69,12 +69,18 @@ Karpenter image to use
 */}}
 {{- define "karpenter.controller.image" -}}
 {{- if .Values.controller.image.digest }}
-{{- printf "%s:%s@%s" .Values.controller.image.repository  (default (printf "v%s" .Chart.AppVersion) .Values.controller.image.tag) .Values.controller.image.digest }}
+{{- printf "%s:%s@%s" .Values.controller.image.repository  (default (printf "%s" .Chart.AppVersion) .Values.controller.image.tag) .Values.controller.image.digest }}
 {{- else }}
-{{- printf "%s:%s" .Values.controller.image.repository  (default (printf "v%s" .Chart.AppVersion) .Values.controller.image.tag) }}
+{{- printf "%s:%s" .Values.controller.image.repository  (default (printf "%s" .Chart.AppVersion) .Values.controller.image.tag) }}
 {{- end }}
 {{- end }}
 
+{{/*
+Karpenter controller container name
+*/}}
+{{- define "karpenter.controller.containerName" -}}
+{{- .Values.controller.containerName | default "controller" -}}
+{{- end -}}
 
 {{/* Get PodDisruptionBudget API Version */}}
 {{- define "karpenter.pdb.apiVersion" -}}
@@ -140,52 +146,3 @@ This works because Helm treats dictionaries as mutable objects and allows passin
 {{- include "karpenter.patchLabelSelector" (merge (dict "_target" $constraint) $) }}
 {{- end }}
 {{- end }}
-
-{{/*
-Flatten Settings Map using "." syntax
-*/}}
-{{- define "flattenSettings" -}}
-{{- $map := first . -}}
-{{- $label := last . -}}
-{{- range $key := (keys $map | uniq | sortAlpha) }}
-  {{- $sublabel := $key -}}
-  {{- $val := (get $map $key) -}}
-  {{- if $label -}}
-    {{- $sublabel = list $label $key | join "." -}}
-  {{- end -}}
-  {{/* Special-case "tags" since we want this to be a JSON object */}}
-  {{- if eq $key "tags" -}}
-    {{- if not (kindIs "invalid" $val) -}}
-      {{- $sublabel | quote | nindent 2 }}: {{ $val | toJson | quote }}
-    {{- end -}}
-  {{- else if kindOf $val | eq "map" -}}
-    {{- list $val $sublabel | include "flattenSettings" -}}
-  {{- else -}}
-  {{- if not (kindIs "invalid" $val) -}}
-    {{- $sublabel | quote | nindent 2 -}}: {{ $val | quote }}
-  {{- end -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
-
-{{/*
-Flatten the stdout logging outputs from args provided
-*/}}
-{{- define "karpenter.controller.outputPathsList" -}}
-{{ $paths := list -}}
-{{- range .Values.controller.outputPaths -}}
-    {{- $paths = printf "%s" . | quote  | append $paths -}}
-{{- end -}}
-{{ $paths | join ", " }}
-{{- end -}}
-
-{{/*
-Flatten the stderr logging outputs from args provided
-*/}}
-{{- define "karpenter.controller.errorOutputPathsList" -}}
-{{ $paths := list -}}
-{{- range .Values.controller.errorOutputPaths -}}
-    {{- $paths = printf "%s" . | quote  | append $paths -}}
-{{- end -}}
-{{ $paths | join ", " }}
-{{- end -}}

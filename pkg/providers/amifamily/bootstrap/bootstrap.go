@@ -20,25 +20,24 @@ import (
 	"strings"
 
 	"github.com/samber/lo"
-	core "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"knative.dev/pkg/ptr"
 
-	"github.com/aws/karpenter-core/pkg/apis/v1alpha5"
-	"github.com/aws/karpenter-core/pkg/utils/resources"
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
 )
 
 // Options is the node bootstrapping parameters passed from Karpenter to the provisioning node
 type Options struct {
-	ClusterName             string
-	ClusterEndpoint         string
-	KubeletConfig           *v1alpha5.KubeletConfiguration
-	Taints                  []core.Taint      `hash:"set"`
-	Labels                  map[string]string `hash:"set"`
-	CABundle                *string
-	AWSENILimitedPodDensity bool
-	ContainerRuntime        *string
-	CustomUserData          *string
+	ClusterName         string
+	ClusterEndpoint     string
+	ClusterCIDR         *string
+	KubeletConfig       *v1.KubeletConfiguration
+	Taints              []corev1.Taint    `hash:"set"`
+	Labels              map[string]string `hash:"set"`
+	CABundle            *string
+	ContainerRuntime    *string
+	CustomUserData      *string
+	InstanceStorePolicy *v1.InstanceStorePolicy
 }
 
 func (o Options) kubeletExtraArgs() (args []string) {
@@ -48,26 +47,26 @@ func (o Options) kubeletExtraArgs() (args []string) {
 		return lo.Compact(args)
 	}
 	if o.KubeletConfig.MaxPods != nil {
-		args = append(args, fmt.Sprintf("--max-pods=%d", ptr.Int32Value(o.KubeletConfig.MaxPods)))
+		args = append(args, fmt.Sprintf("--max-pods=%d", lo.FromPtr(o.KubeletConfig.MaxPods)))
 	}
 	if o.KubeletConfig.PodsPerCore != nil {
-		args = append(args, fmt.Sprintf("--pods-per-core=%d", ptr.Int32Value(o.KubeletConfig.PodsPerCore)))
+		args = append(args, fmt.Sprintf("--pods-per-core=%d", lo.FromPtr(o.KubeletConfig.PodsPerCore)))
 	}
 	// We have to convert some of these maps so that their values return the correct string
-	args = append(args, joinParameterArgs("--system-reserved", resources.StringMap(o.KubeletConfig.SystemReserved), "="))
-	args = append(args, joinParameterArgs("--kube-reserved", resources.StringMap(o.KubeletConfig.KubeReserved), "="))
+	args = append(args, joinParameterArgs("--system-reserved", o.KubeletConfig.SystemReserved, "="))
+	args = append(args, joinParameterArgs("--kube-reserved", o.KubeletConfig.KubeReserved, "="))
 	args = append(args, joinParameterArgs("--eviction-hard", o.KubeletConfig.EvictionHard, "<"))
 	args = append(args, joinParameterArgs("--eviction-soft", o.KubeletConfig.EvictionSoft, "<"))
 	args = append(args, joinParameterArgs("--eviction-soft-grace-period", lo.MapValues(o.KubeletConfig.EvictionSoftGracePeriod, func(v metav1.Duration, _ string) string { return v.Duration.String() }), "="))
 
 	if o.KubeletConfig.EvictionMaxPodGracePeriod != nil {
-		args = append(args, fmt.Sprintf("--eviction-max-pod-grace-period=%d", ptr.Int32Value(o.KubeletConfig.EvictionMaxPodGracePeriod)))
+		args = append(args, fmt.Sprintf("--eviction-max-pod-grace-period=%d", lo.FromPtr(o.KubeletConfig.EvictionMaxPodGracePeriod)))
 	}
 	if o.KubeletConfig.ImageGCHighThresholdPercent != nil {
-		args = append(args, fmt.Sprintf("--image-gc-high-threshold=%d", ptr.Int32Value(o.KubeletConfig.ImageGCHighThresholdPercent)))
+		args = append(args, fmt.Sprintf("--image-gc-high-threshold=%d", lo.FromPtr(o.KubeletConfig.ImageGCHighThresholdPercent)))
 	}
 	if o.KubeletConfig.ImageGCLowThresholdPercent != nil {
-		args = append(args, fmt.Sprintf("--image-gc-low-threshold=%d", ptr.Int32Value(o.KubeletConfig.ImageGCLowThresholdPercent)))
+		args = append(args, fmt.Sprintf("--image-gc-low-threshold=%d", lo.FromPtr(o.KubeletConfig.ImageGCLowThresholdPercent)))
 	}
 	if o.KubeletConfig.CPUCFSQuota != nil {
 		args = append(args, fmt.Sprintf("--cpu-cfs-quota=%t", lo.FromPtr(o.KubeletConfig.CPUCFSQuota)))
@@ -76,12 +75,9 @@ func (o Options) kubeletExtraArgs() (args []string) {
 }
 
 func (o Options) nodeTaintArg() string {
-	if len(o.Taints) == 0 {
-		return ""
-	}
 	var taintStrings []string
 	for _, taint := range o.Taints {
-		taintStrings = append(taintStrings, fmt.Sprintf("%s=%s:%s", taint.Key, taint.Value, taint.Effect))
+		taintStrings = append(taintStrings, taint.ToString())
 	}
 	return fmt.Sprintf("--register-with-taints=%q", strings.Join(taintStrings, ","))
 }
@@ -94,9 +90,6 @@ func (o Options) nodeLabelArg() string {
 	keys := lo.Keys(o.Labels)
 	sort.Strings(keys) // ensures this list is deterministic, for easy testing.
 	for _, key := range keys {
-		if v1alpha5.LabelDomainExceptions.Has(key) {
-			continue
-		}
 		labelStrings = append(labelStrings, fmt.Sprintf("%s=%v", key, o.Labels[key]))
 	}
 	return fmt.Sprintf("--node-labels=%q", strings.Join(labelStrings, ","))

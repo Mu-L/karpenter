@@ -15,20 +15,23 @@ limitations under the License.
 package instancetype
 
 import (
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/aws/karpenter-core/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 )
 
 const (
 	cloudProviderSubsystem = "cloudprovider"
+	instanceTypeLabel      = "instance_type"
+	capacityTypeLabel      = "capacity_type"
+	zoneLabel              = "zone"
 )
 
 var (
-	InstanceTypeLabel = "instance_type"
-
-	InstanceTypeVCPU = prometheus.NewGaugeVec(
+	InstanceTypeVCPU = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
 		prometheus.GaugeOpts{
 			Namespace: metrics.Namespace,
 			Subsystem: cloudProviderSubsystem,
@@ -36,10 +39,11 @@ var (
 			Help:      "VCPUs cores for a given instance type.",
 		},
 		[]string{
-			InstanceTypeLabel,
-		})
-
-	InstanceTypeMemory = prometheus.NewGaugeVec(
+			instanceTypeLabel,
+		},
+	)
+	InstanceTypeMemory = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
 		prometheus.GaugeOpts{
 			Namespace: metrics.Namespace,
 			Subsystem: cloudProviderSubsystem,
@@ -47,10 +51,7 @@ var (
 			Help:      "Memory, in bytes, for a given instance type.",
 		},
 		[]string{
-			InstanceTypeLabel,
-		})
+			instanceTypeLabel,
+		},
+	)
 )
-
-func init() {
-	crmetrics.Registry.MustRegister(InstanceTypeVCPU, InstanceTypeMemory)
-}

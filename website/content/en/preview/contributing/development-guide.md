@@ -43,7 +43,7 @@ make delete # Uninstall Karpenter
 ### Developer Loop
 
 * Make sure dependencies are installed
-    * Run `make codegen` to make sure yaml manifests are generated
+    * Run `make codegen` to make sure yaml manifests are generated (requires a working set of AWS credentials, see [Specifying Credentials](https://docs.aws.amazon.com/sdk-for-go/v1/developer-guide/configuring-sdk.html#specifying-credentials))
     * Run `make toolchain` to install cli tools for building and testing the project
 * You will need a personal development image repository (e.g. ECR)
     * Make sure you have valid credentials to your development repository.
@@ -69,14 +69,14 @@ make image # build and push the karpenter images
 
 ```bash
 make test       # E2E correctness tests
-make battletest # More rigorous tests run in CI environment
 ```
 
 ### Change Log Level
 
+By default, `make apply` will set the log level to debug. You can change the log level by setting the log level in your Helm values.
+
 ```bash
-kubectl patch configmap config-logging -n karpenter --patch '{"data":{"loglevel.controller":"debug"}}' # Debug Level
-kubectl patch configmap config-logging -n karpenter --patch '{"data":{"loglevel.controller":"info"}}' # Info Level
+--set logLevel=debug
 ```
 
 ### Debugging Metrics
@@ -84,13 +84,13 @@ kubectl patch configmap config-logging -n karpenter --patch '{"data":{"loglevel.
 OSX:
 
 ```bash
-open http://localhost:8000/metrics && kubectl port-forward service/karpenter -n karpenter 8000
+open http://localhost:8080/metrics && kubectl port-forward service/karpenter -n kube-system 8080
 ```
 
 Linux:
 
 ```bash
-gio open http://localhost:8000/metrics && kubectl port-forward service/karpenter -n karpenter 8000
+gio open http://localhost:8080/metrics && kubectl port-forward service/karpenter -n karpenter 8080
 ```
 
 ### Tailing Logs
@@ -143,8 +143,8 @@ go install github.com/google/pprof@latest
 ### Get a profile
 ```
 # Connect to the metrics endpoint
-kubectl port-forward service/karpenter -n karpenter 8000
-open http://localhost:8000/debug/pprof/
+kubectl port-forward service/karpenter -n karpenter 8080
+open http://localhost:8080/debug/pprof/
 # Visualize the memory
-go tool pprof -http 0.0.0.0:9000 localhost:8000/debug/pprof/heap
+go tool pprof -http 0.0.0.0:9000 localhost:8080/debug/pprof/heap
 ```

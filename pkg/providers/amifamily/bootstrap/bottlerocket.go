@@ -19,14 +19,12 @@ import (
 	"fmt"
 	"strconv"
 
-	"knative.dev/pkg/ptr"
-
 	"github.com/imdario/mergo"
 	"github.com/samber/lo"
 
-	"github.com/aws/karpenter-core/pkg/utils/resources"
+	"github.com/aws/aws-sdk-go-v2/aws"
 
-	"github.com/aws/aws-sdk-go/aws"
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
 )
 
 type Bottlerocket struct {
@@ -40,7 +38,7 @@ func (b Bottlerocket) Script() (string, error) {
 		return "", fmt.Errorf("invalid UserData %w", err)
 	}
 	// Karpenter will overwrite settings present inside custom UserData
-	// based on other fields specified in the provisioner
+	// based on other fields specified in the NodePool
 	s.Settings.Kubernetes.ClusterName = &b.ClusterName
 	s.Settings.Kubernetes.APIServer = &b.ClusterEndpoint
 	s.Settings.Kubernetes.ClusterCertificate = b.CABundle
@@ -48,11 +46,8 @@ func (b Bottlerocket) Script() (string, error) {
 		return "", err
 	}
 
-	// Backwards compatibility for AWSENILimitedPodDensity flag
 	if b.KubeletConfig != nil && b.KubeletConfig.MaxPods != nil {
-		s.Settings.Kubernetes.MaxPods = aws.Int(int(ptr.Int32Value(b.KubeletConfig.MaxPods)))
-	} else if !b.AWSENILimitedPodDensity {
-		s.Settings.Kubernetes.MaxPods = aws.Int(110)
+		s.Settings.Kubernetes.MaxPods = aws.Int(int(lo.FromPtr(b.KubeletConfig.MaxPods)))
 	}
 
 	if b.KubeletConfig != nil {
@@ -60,10 +55,10 @@ func (b Bottlerocket) Script() (string, error) {
 			s.Settings.Kubernetes.ClusterDNSIP = &b.KubeletConfig.ClusterDNS[0]
 		}
 		if b.KubeletConfig.SystemReserved != nil {
-			s.Settings.Kubernetes.SystemReserved = resources.StringMap(b.KubeletConfig.SystemReserved)
+			s.Settings.Kubernetes.SystemReserved = b.KubeletConfig.SystemReserved
 		}
 		if b.KubeletConfig.KubeReserved != nil {
-			s.Settings.Kubernetes.KubeReserved = resources.StringMap(b.KubeletConfig.KubeReserved)
+			s.Settings.Kubernetes.KubeReserved = b.KubeletConfig.KubeReserved
 		}
 		if b.KubeletConfig.EvictionHard != nil {
 			s.Settings.Kubernetes.EvictionHard = b.KubeletConfig.EvictionHard
@@ -82,6 +77,17 @@ func (b Bottlerocket) Script() (string, error) {
 	s.Settings.Kubernetes.NodeTaints = map[string][]string{}
 	for _, taint := range b.Taints {
 		s.Settings.Kubernetes.NodeTaints[taint.Key] = append(s.Settings.Kubernetes.NodeTaints[taint.Key], fmt.Sprintf("%s:%s", taint.Value, taint.Effect))
+	}
+
+	if lo.FromPtr(b.InstanceStorePolicy) == v1.InstanceStorePolicyRAID0 {
+		if s.Settings.BootstrapCommands == nil {
+			s.Settings.BootstrapCommands = map[string]BootstrapCommand{}
+		}
+		s.Settings.BootstrapCommands["000-mount-instance-storage"] = BootstrapCommand{
+			Commands:  [][]string{{"apiclient", "ephemeral-storage", "init"}, {"apiclient", "ephemeral-storage", "bind", "--dirs", "/var/lib/containerd", "/var/lib/kubelet", "/var/log/pods"}},
+			Essential: true,
+			Mode:      BootstrapCommandModeAlways,
+		}
 	}
 	script, err := s.MarshalTOML()
 	if err != nil {

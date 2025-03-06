@@ -15,47 +15,60 @@ limitations under the License.
 package pricing
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
+	"fmt"
+	"maps"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
-	"github.com/aws/aws-sdk-go/service/pricing"
-	"github.com/aws/aws-sdk-go/service/pricing/pricingiface"
-	"github.com/prometheus/client_golang/prometheus"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	sdk "github.com/aws/karpenter-provider-aws/pkg/aws"
+	"github.com/aws/karpenter-provider-aws/pkg/operator/options"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/pricing"
+	pricingtypes "github.com/aws/aws-sdk-go-v2/service/pricing/types"
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
-	"knative.dev/pkg/logging"
-
-	"github.com/aws/karpenter-core/pkg/utils/pretty"
+	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
 
-// Provider provides actual pricing data to the AWS cloud provider to allow it to make more informed decisions
+var initialOnDemandPrices = lo.Assign(InitialOnDemandPricesAWS, InitialOnDemandPricesUSGov, InitialOnDemandPricesCN)
+
+type Provider interface {
+	LivenessProbe(*http.Request) error
+	InstanceTypes() []ec2types.InstanceType
+	OnDemandPrice(ec2types.InstanceType) (float64, bool)
+	SpotPrice(ec2types.InstanceType, string) (float64, bool)
+	UpdateOnDemandPricing(context.Context) error
+	UpdateSpotPricing(context.Context) error
+}
+
+// DefaultProvider provides actual pricing data to the AWS cloud provider to allow it to make more informed decisions
 // regarding which instances to launch.  This is initialized at startup with a periodically updated static price list to
 // support running in locations where pricing data is unavailable.  In those cases the static pricing data provides a
 // relative ordering that is still more accurate than our previous pricing model.  In the event that a pricing update
 // fails, the previous pricing information is retained and used which may be the static initial pricing data if pricing
 // updates never succeed.
-type Provider struct {
-	ec2     ec2iface.EC2API
-	pricing pricingiface.PricingAPI
+type DefaultProvider struct {
+	ec2     sdk.EC2API
+	pricing sdk.PricingAPI
 	region  string
 	cm      *pretty.ChangeMonitor
 
-	mu                 sync.RWMutex
-	onDemandUpdateTime time.Time
-	onDemandPrices     map[string]float64
-	spotUpdateTime     time.Time
-	spotPrices         map[string]zonal
+	muOnDemand     sync.RWMutex
+	onDemandPrices map[ec2types.InstanceType]float64
+
+	muSpot             sync.RWMutex
+	spotPrices         map[ec2types.InstanceType]zonal
+	spotPricingUpdated bool
 }
 
 // zonalPricing is used to capture the per-zone price
@@ -67,11 +80,6 @@ type zonal struct {
 	prices       map[string]float64
 }
 
-type Err struct {
-	error
-	lastUpdateTime time.Time
-}
-
 func newZonalPricing(defaultPrice float64) zonal {
 	z := zonal{
 		prices: map[string]float64{},
@@ -81,20 +89,24 @@ func newZonalPricing(defaultPrice float64) zonal {
 }
 
 // NewPricingAPI returns a pricing API configured based on a particular region
-func NewAPI(sess *session.Session, region string) pricingiface.PricingAPI {
-	if sess == nil {
-		return nil
-	}
+func NewAPI(cfg aws.Config) *pricing.Client {
 	// pricing API doesn't have an endpoint in all regions
 	pricingAPIRegion := "us-east-1"
-	if strings.HasPrefix(region, "ap-") || strings.HasPrefix(region, "cn-") {
+	if strings.HasPrefix(cfg.Region, "ap-") {
 		pricingAPIRegion = "ap-south-1"
+	} else if strings.HasPrefix(cfg.Region, "cn-") {
+		pricingAPIRegion = "cn-northwest-1"
+	} else if strings.HasPrefix(cfg.Region, "eu-") {
+		pricingAPIRegion = "eu-central-1"
 	}
-	return pricing.New(sess, &aws.Config{Region: aws.String(pricingAPIRegion)})
+	//create pricing config using pricing endpoint
+	pricingCfg := cfg.Copy()
+	pricingCfg.Region = pricingAPIRegion
+	return pricing.NewFromConfig(pricingCfg)
 }
 
-func NewProvider(_ context.Context, pricing pricingiface.PricingAPI, ec2Api ec2iface.EC2API, region string) *Provider {
-	p := &Provider{
+func NewDefaultProvider(_ context.Context, pricing sdk.PricingAPI, ec2Api sdk.EC2API, region string) *DefaultProvider {
+	p := &DefaultProvider{
 		region:  region,
 		ec2:     ec2Api,
 		pricing: pricing,
@@ -107,31 +119,19 @@ func NewProvider(_ context.Context, pricing pricingiface.PricingAPI, ec2Api ec2i
 }
 
 // InstanceTypes returns the list of all instance types for which either a spot or on-demand price is known.
-func (p *Provider) InstanceTypes() []string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+func (p *DefaultProvider) InstanceTypes() []ec2types.InstanceType {
+	p.muOnDemand.RLock()
+	p.muSpot.RLock()
+	defer p.muOnDemand.RUnlock()
+	defer p.muSpot.RUnlock()
 	return lo.Union(lo.Keys(p.onDemandPrices), lo.Keys(p.spotPrices))
-}
-
-// OnDemandLastUpdated returns the time that the on-demand pricing was last updated
-func (p *Provider) OnDemandLastUpdated() time.Time {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.onDemandUpdateTime
-}
-
-// SpotLastUpdated returns the time that the spot pricing was last updated
-func (p *Provider) SpotLastUpdated() time.Time {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.spotUpdateTime
 }
 
 // OnDemandPrice returns the last known on-demand price for a given instance type, returning an error if there is no
 // known on-demand pricing for the instance type.
-func (p *Provider) OnDemandPrice(instanceType string) (float64, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+func (p *DefaultProvider) OnDemandPrice(instanceType ec2types.InstanceType) (float64, bool) {
+	p.muOnDemand.RLock()
+	defer p.muOnDemand.RUnlock()
 	price, ok := p.onDemandPrices[instanceType]
 	if !ok {
 		return 0.0, false
@@ -141,11 +141,11 @@ func (p *Provider) OnDemandPrice(instanceType string) (float64, bool) {
 
 // SpotPrice returns the last known spot price for a given instance type and zone, returning an error
 // if there is no known spot pricing for that instance type or zone
-func (p *Provider) SpotPrice(instanceType string, zone string) (float64, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+func (p *DefaultProvider) SpotPrice(instanceType ec2types.InstanceType, zone string) (float64, bool) {
+	p.muSpot.RLock()
+	defer p.muSpot.RUnlock()
 	if val, ok := p.spotPrices[instanceType]; ok {
-		if p.spotUpdateTime.Equal(initialPriceUpdate) {
+		if !p.spotPricingUpdated {
 			return val.defaultPrice, true
 		}
 		if price, ok := p.spotPrices[instanceType].prices[zone]; ok {
@@ -156,24 +156,36 @@ func (p *Provider) SpotPrice(instanceType string, zone string) (float64, bool) {
 	return 0.0, false
 }
 
-func (p *Provider) UpdateOnDemandPricing(ctx context.Context) error {
+func (p *DefaultProvider) UpdateOnDemandPricing(ctx context.Context) error {
 	// standard on-demand instances
 	var wg sync.WaitGroup
-	var onDemandPrices, onDemandMetalPrices map[string]float64
+	var onDemandPrices, onDemandMetalPrices map[ec2types.InstanceType]float64
 	var onDemandErr, onDemandMetalErr error
+
+	// if we are in isolated vpc, skip updating on demand pricing
+	// as pricing api may not be available
+	if options.FromContext(ctx).IsolatedVPC {
+		if p.cm.HasChanged("on-demand-prices", nil) {
+			log.FromContext(ctx).V(1).Info("running in an isolated VPC, on-demand pricing information will not be updated")
+		}
+		return nil
+	}
+
+	p.muOnDemand.Lock()
+	defer p.muOnDemand.Unlock()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		onDemandPrices, onDemandErr = p.fetchOnDemandPricing(ctx,
-			&pricing.Filter{
+			pricingtypes.Filter{
 				Field: aws.String("tenancy"),
-				Type:  aws.String("TERM_MATCH"),
+				Type:  "TERM_MATCH",
 				Value: aws.String("Shared"),
 			},
-			&pricing.Filter{
+			pricingtypes.Filter{
 				Field: aws.String("productFamily"),
-				Type:  aws.String("TERM_MATCH"),
+				Type:  "TERM_MATCH",
 				Value: aws.String("Compute Instance"),
 			})
 	}()
@@ -183,93 +195,120 @@ func (p *Provider) UpdateOnDemandPricing(ctx context.Context) error {
 	go func() {
 		defer wg.Done()
 		onDemandMetalPrices, onDemandMetalErr = p.fetchOnDemandPricing(ctx,
-			&pricing.Filter{
+			pricingtypes.Filter{
 				Field: aws.String("tenancy"),
-				Type:  aws.String("TERM_MATCH"),
+				Type:  "TERM_MATCH",
 				Value: aws.String("Dedicated"),
 			},
-			&pricing.Filter{
+			pricingtypes.Filter{
 				Field: aws.String("productFamily"),
-				Type:  aws.String("TERM_MATCH"),
+				Type:  "TERM_MATCH",
 				Value: aws.String("Compute Instance (bare metal)"),
 			})
 	}()
 
 	wg.Wait()
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	err := multierr.Append(onDemandErr, onDemandMetalErr)
 	if err != nil {
-		return &Err{error: err, lastUpdateTime: p.onDemandUpdateTime}
+		return fmt.Errorf("retreiving on-demand pricing data, %w", err)
 	}
 
 	if len(onDemandPrices) == 0 || len(onDemandMetalPrices) == 0 {
-		return &Err{error: errors.New("no on-demand pricing found"), lastUpdateTime: p.onDemandUpdateTime}
+		return fmt.Errorf("no on-demand pricing found")
 	}
 
 	p.onDemandPrices = lo.Assign(onDemandPrices, onDemandMetalPrices)
-	p.onDemandUpdateTime = time.Now()
-	for instanceType, price := range p.onDemandPrices {
-		InstancePriceEstimate.With(prometheus.Labels{
-			InstanceTypeLabel: instanceType,
-			CapacityTypeLabel: ec2.UsageClassTypeOnDemand,
-			RegionLabel:       p.region,
-			TopologyLabel:     "",
-		}).Set(price)
-	}
 	if p.cm.HasChanged("on-demand-prices", p.onDemandPrices) {
-		logging.FromContext(ctx).With("instance-type-count", len(p.onDemandPrices)).Debugf("updated on-demand pricing")
+		log.FromContext(ctx).WithValues("instance-type-count", len(p.onDemandPrices)).V(1).Info("updated on-demand pricing")
 	}
 	return nil
 }
 
-func (p *Provider) fetchOnDemandPricing(ctx context.Context, additionalFilters ...*pricing.Filter) (map[string]float64, error) {
-	prices := map[string]float64{}
-	filters := append([]*pricing.Filter{
+func (p *DefaultProvider) fetchOnDemandPricing(ctx context.Context, additionalFilters ...pricingtypes.Filter) (map[ec2types.InstanceType]float64, error) {
+	prices := map[ec2types.InstanceType]float64{}
+	filters := append([]pricingtypes.Filter{
 		{
 			Field: aws.String("regionCode"),
-			Type:  aws.String("TERM_MATCH"),
+			Type:  "TERM_MATCH",
 			Value: aws.String(p.region),
 		},
 		{
 			Field: aws.String("serviceCode"),
-			Type:  aws.String("TERM_MATCH"),
+			Type:  "TERM_MATCH",
 			Value: aws.String("AmazonEC2"),
 		},
 		{
 			Field: aws.String("preInstalledSw"),
-			Type:  aws.String("TERM_MATCH"),
+			Type:  "TERM_MATCH",
 			Value: aws.String("NA"),
 		},
 		{
 			Field: aws.String("operatingSystem"),
-			Type:  aws.String("TERM_MATCH"),
+			Type:  "TERM_MATCH",
 			Value: aws.String("Linux"),
 		},
 		{
 			Field: aws.String("capacitystatus"),
-			Type:  aws.String("TERM_MATCH"),
+			Type:  "TERM_MATCH",
 			Value: aws.String("Used"),
 		},
 		{
 			Field: aws.String("marketoption"),
-			Type:  aws.String("TERM_MATCH"),
+			Type:  "TERM_MATCH",
 			Value: aws.String("OnDemand"),
 		}},
 		additionalFilters...)
-	if err := p.pricing.GetProductsPagesWithContext(ctx, &pricing.GetProductsInput{
+
+	input := &pricing.GetProductsInput{
 		Filters:     filters,
-		ServiceCode: aws.String("AmazonEC2")}, p.onDemandPage(prices)); err != nil {
-		return nil, err
+		ServiceCode: aws.String("AmazonEC2"),
 	}
+
+	paginator := pricing.NewGetProductsPaginator(p.pricing, input)
+	for paginator.HasMorePages() {
+		output, err := paginator.NextPage(ctx)
+
+		if err != nil {
+			return nil, fmt.Errorf("getting pricing data, %w", err)
+		}
+		prices = lo.Assign(prices, p.onDemandPage(ctx, output))
+	}
+
 	return prices, nil
+}
+
+func (p *DefaultProvider) spotPage(ctx context.Context, output *ec2.DescribeSpotPriceHistoryOutput) map[ec2types.InstanceType]zonal {
+	result := map[ec2types.InstanceType]zonal{}
+	for _, sph := range output.SpotPriceHistory {
+		spotPriceStr := aws.ToString(sph.SpotPrice)
+		spotPrice, err := strconv.ParseFloat(spotPriceStr, 64)
+		// these errors shouldn't occur, but if pricing API does have an error, we ignore the record
+		if err != nil {
+			log.FromContext(ctx).V(1).Info(fmt.Sprintf("unable to parse price record %#v", sph))
+			continue
+		}
+		if sph.Timestamp == nil {
+			continue
+		}
+		instanceType := sph.InstanceType
+		az := aws.ToString(sph.AvailabilityZone)
+		_, ok := result[instanceType]
+		if !ok {
+			result[instanceType] = zonal{
+				prices: map[string]float64{},
+			}
+		}
+		result[instanceType].prices[az] = spotPrice
+
+	}
+	return result
 }
 
 // turning off cyclo here, it measures as a 12 due to all of the type checks of the pricing data which returns a deeply
 // nested map[string]interface{}
 // nolint: gocyclo
-func (p *Provider) onDemandPage(prices map[string]float64) func(output *pricing.GetProductsOutput, b bool) bool {
+func (p *DefaultProvider) onDemandPage(ctx context.Context, output *pricing.GetProductsOutput) map[ec2types.InstanceType]float64 {
 	// this isn't the full pricing struct, just the portions we care about
 	type priceItem struct {
 		Product struct {
@@ -286,121 +325,98 @@ func (p *Provider) onDemandPage(prices map[string]float64) func(output *pricing.
 		}
 	}
 
-	return func(output *pricing.GetProductsOutput, b bool) bool {
-		currency := "USD"
-		if p.region == "cn-north-1" {
-			currency = "CNY"
-		}
-		for _, outer := range output.PriceList {
-			var buf bytes.Buffer
-			enc := json.NewEncoder(&buf)
-			if err := enc.Encode(outer); err != nil {
-				logging.FromContext(context.Background()).Errorf("encoding %s", err)
-			}
-			dec := json.NewDecoder(&buf)
-			var pItem priceItem
-			if err := dec.Decode(&pItem); err != nil {
-				logging.FromContext(context.Background()).Errorf("decoding %s", err)
-			}
-			if pItem.Product.Attributes.InstanceType == "" {
-				continue
-			}
-			for _, term := range pItem.Terms.OnDemand {
-				for _, v := range term.PriceDimensions {
-					price, err := strconv.ParseFloat(v.PricePerUnit[currency], 64)
-					if err != nil || price == 0 {
-						continue
-					}
-					prices[pItem.Product.Attributes.InstanceType] = price
-				}
-			}
-		}
-		return true
+	result := map[ec2types.InstanceType]float64{}
+	currency := "USD"
+	if strings.HasPrefix(p.region, "cn-") {
+		currency = "CNY"
 	}
+	for _, outer := range output.PriceList {
+		pItem := &priceItem{}
+		if err := json.Unmarshal([]byte(outer), pItem); err != nil {
+			log.FromContext(ctx).Error(err, "failed unmarshaling pricing data")
+		}
+		if pItem.Product.Attributes.InstanceType == "" {
+			continue
+		}
+		for _, term := range pItem.Terms.OnDemand {
+			for _, v := range term.PriceDimensions {
+				price, err := strconv.ParseFloat(v.PricePerUnit[currency], 64)
+				if err != nil || price == 0 {
+					continue
+				}
+				result[ec2types.InstanceType(pItem.Product.Attributes.InstanceType)] = price
+			}
+		}
+	}
+
+	return result
 }
 
 // nolint: gocyclo
-func (p *Provider) UpdateSpotPricing(ctx context.Context) error {
-	totalOfferings := 0
+func (p *DefaultProvider) UpdateSpotPricing(ctx context.Context) error {
+	prices := map[ec2types.InstanceType]zonal{}
 
-	prices := map[string]map[string]float64{}
-	err := p.ec2.DescribeSpotPriceHistoryPagesWithContext(ctx, &ec2.DescribeSpotPriceHistoryInput{
-		ProductDescriptions: []*string{aws.String("Linux/UNIX"), aws.String("Linux/UNIX (Amazon VPC)")},
+	p.muSpot.Lock()
+	defer p.muSpot.Unlock()
+
+	input := &ec2.DescribeSpotPriceHistoryInput{
+		ProductDescriptions: []string{
+			"Linux/UNIX",
+			"Linux/UNIX (Amazon VPC)",
+		},
 		// get the latest spot price for each instance type
 		StartTime: aws.Time(time.Now()),
-	}, func(output *ec2.DescribeSpotPriceHistoryOutput, b bool) bool {
-		for _, sph := range output.SpotPriceHistory {
-			spotPriceStr := aws.StringValue(sph.SpotPrice)
-			spotPrice, err := strconv.ParseFloat(spotPriceStr, 64)
-			// these errors shouldn't occur, but if pricing API does have an error, we ignore the record
-			if err != nil {
-				logging.FromContext(ctx).Debugf("unable to parse price record %#v", sph)
-				continue
-			}
-			if sph.Timestamp == nil {
-				continue
-			}
-			instanceType := aws.StringValue(sph.InstanceType)
-			az := aws.StringValue(sph.AvailabilityZone)
-			_, ok := prices[instanceType]
-			if !ok {
-				prices[instanceType] = map[string]float64{}
-			}
-			prices[instanceType][az] = spotPrice
-			InstancePriceEstimate.With(prometheus.Labels{
-				InstanceTypeLabel: instanceType,
-				CapacityTypeLabel: ec2.UsageClassTypeSpot,
-				RegionLabel:       p.region,
-				TopologyLabel:     az,
-			}).Set(spotPrice)
-		}
-		return true
-	})
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	}
 
-	if err != nil {
-		return &Err{error: err, lastUpdateTime: p.spotUpdateTime}
+	paginator := ec2.NewDescribeSpotPriceHistoryPaginator(p.ec2, input)
+	for paginator.HasMorePages() {
+		output, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("retrieving spot pricing data, %w", err)
+		}
+		prices = lo.Assign(prices, p.spotPage(ctx, output))
 	}
 	if len(prices) == 0 {
-		return &Err{error: errors.New("no spot pricing found"), lastUpdateTime: p.spotUpdateTime}
+		return fmt.Errorf("no spot pricing found")
 	}
+
+	totalOfferings := 0
 	for it, zoneData := range prices {
 		if _, ok := p.spotPrices[it]; !ok {
 			p.spotPrices[it] = newZonalPricing(0)
 		}
-		for zone, price := range zoneData {
-			p.spotPrices[it].prices[zone] = price
-		}
-		totalOfferings += len(zoneData)
+		maps.Copy(p.spotPrices[it].prices, zoneData.prices)
+		totalOfferings += len(zoneData.prices)
 	}
 
-	p.spotUpdateTime = time.Now()
+	p.spotPricingUpdated = true
 	if p.cm.HasChanged("spot-prices", p.spotPrices) {
-		logging.FromContext(ctx).With(
+		log.FromContext(ctx).WithValues(
 			"instance-type-count", len(p.onDemandPrices),
-			"offering-count", totalOfferings).Debugf("updated spot pricing with instance types and offerings")
+			"offering-count", totalOfferings).V(1).Info("updated spot pricing with instance types and offerings")
 	}
 	return nil
 }
 
-func (p *Provider) LivenessProbe(_ *http.Request) error {
+func (p *DefaultProvider) LivenessProbe(_ *http.Request) error {
 	// ensure we don't deadlock and nolint for the empty critical section
-	p.mu.Lock()
+	p.muOnDemand.Lock()
+	p.muSpot.Lock()
 	//nolint: staticcheck
-	p.mu.Unlock()
+	p.muOnDemand.Unlock()
+	p.muSpot.Unlock()
 	return nil
 }
 
-func populateInitialSpotPricing(pricing map[string]float64) map[string]zonal {
-	m := map[string]zonal{}
+func populateInitialSpotPricing(pricing map[ec2types.InstanceType]float64) map[ec2types.InstanceType]zonal {
+	m := map[ec2types.InstanceType]zonal{}
 	for it, price := range pricing {
 		m[it] = newZonalPricing(price)
 	}
 	return m
 }
 
-func (p *Provider) Reset() {
+func (p *DefaultProvider) Reset() {
 	// see if we've got region specific pricing data
 	staticPricing, ok := initialOnDemandPrices[p.region]
 	if !ok {
@@ -411,6 +427,5 @@ func (p *Provider) Reset() {
 	p.onDemandPrices = staticPricing
 	// default our spot pricing to the same as the on-demand pricing until a price update
 	p.spotPrices = populateInitialSpotPricing(staticPricing)
-	p.onDemandUpdateTime = initialPriceUpdate
-	p.spotUpdateTime = initialPriceUpdate
+	p.spotPricingUpdated = false
 }

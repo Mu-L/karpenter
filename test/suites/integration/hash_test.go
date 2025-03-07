@@ -15,59 +15,41 @@ limitations under the License.
 package integration_test
 
 import (
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/aws/karpenter-core/pkg/apis/v1alpha5"
-	"github.com/aws/karpenter-core/pkg/test"
-	"github.com/aws/karpenter/pkg/apis/settings"
-	"github.com/aws/karpenter/pkg/apis/v1alpha1"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
-	awstest "github.com/aws/karpenter/pkg/test"
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("CRD Hash", func() {
-	It("should have Provisioner hash", func() {
-		nodeTemplate := awstest.AWSNodeTemplate(v1alpha1.AWSNodeTemplateSpec{
-			AWS: v1alpha1.AWS{
-				SecurityGroupSelector: map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-				SubnetSelector:        map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-			},
-		})
-		provisioner := test.Provisioner(test.ProvisionerOptions{
-			ProviderRef: &v1alpha5.MachineTemplateRef{Name: nodeTemplate.Name},
-		})
-
-		env.ExpectCreated(nodeTemplate, provisioner)
+	It("should have NodePool hash", func() {
+		env.ExpectCreated(nodeClass, nodePool)
 
 		Eventually(func(g Gomega) {
-			var prov v1alpha5.Provisioner
-			err := env.Client.Get(env, client.ObjectKeyFromObject(provisioner), &prov)
+			np := &karpv1.NodePool{}
+			err := env.Client.Get(env, client.ObjectKeyFromObject(nodePool), np)
 			g.Expect(err).ToNot(HaveOccurred())
 
-			hash, found := prov.Annotations[v1alpha5.ProvisionerHashAnnotationKey]
+			hash, found := np.Annotations[karpv1.NodePoolHashAnnotationKey]
 			g.Expect(found).To(BeTrue())
-			g.Expect(hash).To(Equal(provisioner.Hash()))
+			g.Expect(hash).To(Equal(np.Hash()))
 		})
 	})
-	It("should have AWSNodeTemplate hash", func() {
-		nodeTemplate := awstest.AWSNodeTemplate(v1alpha1.AWSNodeTemplateSpec{
-			AWS: v1alpha1.AWS{
-				SecurityGroupSelector: map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-				SubnetSelector:        map[string]string{"karpenter.sh/discovery": settings.FromContext(env.Context).ClusterName},
-			},
-		})
-		env.ExpectCreated(nodeTemplate)
+	It("should have EC2NodeClass hash", func() {
+		env.ExpectCreated(nodeClass)
 
 		Eventually(func(g Gomega) {
-			var ant v1alpha1.AWSNodeTemplate
-			err := env.Client.Get(env, client.ObjectKeyFromObject(nodeTemplate), &ant)
+			nc := &v1.EC2NodeClass{}
+			err := env.Client.Get(env, client.ObjectKeyFromObject(nodeClass), nc)
 			g.Expect(err).ToNot(HaveOccurred())
 
-			hash, found := ant.Annotations[v1alpha1.AnnotationNodeTemplateHash]
+			hash, found := nc.Annotations[v1.AnnotationEC2NodeClassHash]
 			g.Expect(found).To(BeTrue())
-			g.Expect(hash).To(Equal(nodeTemplate.Hash()))
+			g.Expect(hash).To(Equal(nc.Hash()))
 		})
 	})
 })

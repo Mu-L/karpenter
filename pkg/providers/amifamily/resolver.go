@@ -18,65 +18,74 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/imdario/mergo"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/samber/lo"
-	core "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
-	"github.com/aws/karpenter/pkg/apis/v1alpha1"
-	"github.com/aws/karpenter/pkg/providers/amifamily/bootstrap"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
-	"github.com/aws/karpenter-core/pkg/apis/v1alpha5"
-	"github.com/aws/karpenter-core/pkg/cloudprovider"
-	"github.com/aws/karpenter-core/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
+
+	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/amifamily/bootstrap"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/ssm"
 )
 
-var DefaultEBS = v1alpha1.BlockDevice{
+var DefaultEBS = v1.BlockDevice{
 	Encrypted:  aws.Bool(true),
-	VolumeType: aws.String(ec2.VolumeTypeGp3),
+	VolumeType: aws.String(string(ec2types.VolumeTypeGp3)),
 	VolumeSize: lo.ToPtr(resource.MustParse("20Gi")),
 }
 
-// Resolver is able to fill-in dynamic launch template parameters
-type Resolver struct {
-	amiProvider *Provider
+type Resolver interface {
+	Resolve(*v1.EC2NodeClass, *karpv1.NodeClaim, []*cloudprovider.InstanceType, string, *Options) ([]*LaunchTemplate, error)
 }
+
+// DefaultResolver is able to fill-in dynamic launch template parameters
+type DefaultResolver struct{}
 
 // Options define the static launch template parameters
 type Options struct {
-	ClusterName             string
-	ClusterEndpoint         string
-	AWSENILimitedPodDensity bool
-	InstanceProfile         string
-	CABundle                *string `hash:"ignore"`
+	ClusterName         string
+	ClusterEndpoint     string
+	ClusterCIDR         *string
+	InstanceProfile     string
+	CABundle            *string `hash:"ignore"`
+	InstanceStorePolicy *v1.InstanceStorePolicy
 	// Level-triggered fields that may change out of sync.
-	SecurityGroups           []v1alpha1.SecurityGroup
+	SecurityGroups           []v1.SecurityGroup
 	Tags                     map[string]string
 	Labels                   map[string]string `hash:"ignore"`
 	KubeDNSIP                net.IP
 	AssociatePublicIPAddress *bool
+	NodeClassName            string
 }
 
 // LaunchTemplate holds the dynamically generated launch template parameters
 type LaunchTemplate struct {
 	*Options
-	UserData            bootstrap.Bootstrapper
-	BlockDeviceMappings []*v1alpha1.BlockDeviceMapping
-	MetadataOptions     *v1alpha1.MetadataOptions
-	AMIID               string
-	InstanceTypes       []*cloudprovider.InstanceType `hash:"ignore"`
-	DetailedMonitoring  bool
+	UserData              bootstrap.Bootstrapper
+	BlockDeviceMappings   []*v1.BlockDeviceMapping
+	MetadataOptions       *v1.MetadataOptions
+	AMIID                 string
+	InstanceTypes         []*cloudprovider.InstanceType `hash:"ignore"`
+	DetailedMonitoring    bool
+	EFACount              int
+	CapacityType          string
+	CapacityReservationID string
 }
 
 // AMIFamily can be implemented to override the default logic for generating dynamic launch template parameters
 type AMIFamily interface {
-	DefaultAMIs(version string) []DefaultAMIOutput
-	UserData(kubeletConfig *v1alpha5.KubeletConfiguration, taints []core.Taint, labels map[string]string, caBundle *string, instanceTypes []*cloudprovider.InstanceType, customUserData *string) bootstrap.Bootstrapper
-	DefaultBlockDeviceMappings() []*v1alpha1.BlockDeviceMapping
-	DefaultMetadataOptions() *v1alpha1.MetadataOptions
+	DescribeImageQuery(ctx context.Context, ssmProvider ssm.Provider, k8sVersion string, amiVersion string) (DescribeImageQuery, error)
+	UserData(kubeletConfig *v1.KubeletConfiguration, taints []corev1.Taint, labels map[string]string, caBundle *string, instanceTypes []*cloudprovider.InstanceType, customUserData *string, instanceStorePolicy *v1.InstanceStorePolicy) bootstrap.Bootstrapper
+	DefaultBlockDeviceMappings() []*v1.BlockDeviceMapping
+	DefaultMetadataOptions() *v1.MetadataOptions
 	EphemeralBlockDevice() *string
 	FeatureFlags() FeatureFlags
 }
@@ -106,101 +115,94 @@ func (d DefaultFamily) FeatureFlags() FeatureFlags {
 	}
 }
 
-// New constructs a new launch template Resolver
-func New(amiProvider *Provider) *Resolver {
-	return &Resolver{
-		amiProvider: amiProvider,
-	}
+// NewDefaultResolver constructs a new launch template DefaultResolver
+func NewDefaultResolver() *DefaultResolver {
+	return &DefaultResolver{}
 }
 
 // Resolve generates launch templates using the static options and dynamically generates launch template parameters.
 // Multiple ResolvedTemplates are returned based on the instanceTypes passed in to support special AMIs for certain instance types like GPUs.
-func (r Resolver) Resolve(ctx context.Context, nodeTemplate *v1alpha1.AWSNodeTemplate, machine *v1alpha5.Machine, instanceTypes []*cloudprovider.InstanceType, options *Options) ([]*LaunchTemplate, error) {
-	amiFamily := GetAMIFamily(nodeTemplate.Spec.AMIFamily, options)
-	amis, err := r.amiProvider.Get(ctx, nodeTemplate, options)
-	if err != nil {
-		return nil, err
-	}
-	if len(amis) == 0 {
+func (r DefaultResolver) Resolve(nodeClass *v1.EC2NodeClass, nodeClaim *karpv1.NodeClaim, instanceTypes []*cloudprovider.InstanceType, capacityType string, options *Options) ([]*LaunchTemplate, error) {
+	amiFamily := GetAMIFamily(nodeClass.AMIFamily(), options)
+	if len(nodeClass.Status.AMIs) == 0 {
 		return nil, fmt.Errorf("no amis exist given constraints")
 	}
-	mappedAMIs := MapInstanceTypes(amis, instanceTypes)
+	mappedAMIs := MapToInstanceTypes(instanceTypes, nodeClass.Status.AMIs)
 	if len(mappedAMIs) == 0 {
-		return nil, fmt.Errorf("no instance types satisfy requirements of amis %v,", amis)
+		return nil, fmt.Errorf("no instance types satisfy requirements of amis %v", lo.Uniq(lo.Map(nodeClass.Status.AMIs, func(a v1.AMI, _ int) string { return a.ID })))
 	}
 	var resolvedTemplates []*LaunchTemplate
 	for amiID, instanceTypes := range mappedAMIs {
-		maxPodsToInstanceTypes := lo.GroupBy(instanceTypes, func(instanceType *cloudprovider.InstanceType) int {
-			return int(instanceType.Capacity.Pods().Value())
-		})
 		// In order to support reserved ENIs for CNI custom networking setups,
 		// we need to pass down the max-pods calculation to the kubelet.
 		// This requires that we resolve a unique launch template per max-pods value.
-		for maxPods, instanceTypes := range maxPodsToInstanceTypes {
-			kubeletConfig := &v1alpha5.KubeletConfiguration{}
-			if machine.Spec.Kubelet != nil {
-				if err := mergo.Merge(kubeletConfig, machine.Spec.Kubelet); err != nil {
-					return nil, err
-				}
-			}
-			if kubeletConfig.MaxPods == nil {
-				kubeletConfig.MaxPods = lo.ToPtr(int32(maxPods))
-			}
-			resolved := &LaunchTemplate{
-				Options: options,
-				UserData: amiFamily.UserData(
-					r.defaultClusterDNS(options, kubeletConfig),
-					append(machine.Spec.Taints, machine.Spec.StartupTaints...),
-					options.Labels,
-					options.CABundle,
-					instanceTypes,
-					nodeTemplate.Spec.UserData,
+		// Similarly, instance types configured with EFAs require unique launch templates depending on the number of
+		// EFAs they support.
+		// Reservations IDs are also included since we need to create a separate LaunchTemplate per reservation ID when
+		// launching reserved capacity. If it's a reserved capacity launch, we've already filtered the instance types
+		// further up the call stack.
+		type launchTemplateParams struct {
+			efaCount int
+			maxPods  int
+			// reservationIDs is encoded as a string rather than a slice to ensure this type is comparable for use by `lo.GroupBy`.
+			reservationIDs string
+		}
+		paramsToInstanceTypes := lo.GroupBy(instanceTypes, func(it *cloudprovider.InstanceType) launchTemplateParams {
+			return launchTemplateParams{
+				efaCount: lo.Ternary(
+					lo.Contains(lo.Keys(nodeClaim.Spec.Resources.Requests), v1.ResourceEFA),
+					int(lo.ToPtr(it.Capacity[v1.ResourceEFA]).Value()),
+					0,
 				),
-				BlockDeviceMappings: nodeTemplate.Spec.BlockDeviceMappings,
-				MetadataOptions:     nodeTemplate.Spec.MetadataOptions,
-				DetailedMonitoring:  aws.BoolValue(nodeTemplate.Spec.DetailedMonitoring),
-				AMIID:               amiID,
-				InstanceTypes:       instanceTypes,
+				maxPods: int(it.Capacity.Pods().Value()),
+				// If we're dealing with reserved instances, there's only going to be a single instance per group. This invariant
+				// is due to reservation IDs not being shared across instance types. Because of this, we don't need to worry about
+				// ordering in this string.
+				reservationIDs: lo.Ternary(
+					capacityType == karpv1.CapacityTypeReserved,
+					strings.Join(lo.FilterMap(it.Offerings, func(o *cloudprovider.Offering, _ int) (string, bool) {
+						return o.ReservationID(), o.CapacityType() == karpv1.CapacityTypeReserved
+					}), ","),
+					"",
+				),
 			}
-			if resolved.BlockDeviceMappings == nil {
-				resolved.BlockDeviceMappings = amiFamily.DefaultBlockDeviceMappings()
-			}
-			if resolved.MetadataOptions == nil {
-				resolved.MetadataOptions = amiFamily.DefaultMetadataOptions()
-			}
-			resolvedTemplates = append(resolvedTemplates, resolved)
+		})
+
+		for params, instanceTypes := range paramsToInstanceTypes {
+			reservationIDs := strings.Split(params.reservationIDs, ",")
+			resolvedTemplates = append(resolvedTemplates, r.resolveLaunchTemplates(nodeClass, nodeClaim, instanceTypes, capacityType, amiFamily, amiID, params.maxPods, params.efaCount, reservationIDs, options)...)
 		}
 	}
 	return resolvedTemplates, nil
 }
 
-func GetAMIFamily(amiFamily *string, options *Options) AMIFamily {
-	switch aws.StringValue(amiFamily) {
-	case v1alpha1.AMIFamilyBottlerocket:
+func GetAMIFamily(amiFamily string, options *Options) AMIFamily {
+	switch amiFamily {
+	case v1.AMIFamilyBottlerocket:
 		return &Bottlerocket{Options: options}
-	case v1alpha1.AMIFamilyUbuntu:
-		return &Ubuntu{Options: options}
-	case v1alpha1.AMIFamilyWindows2019:
-		return &Windows{Options: options, Version: v1alpha1.Windows2019, Build: v1alpha1.Windows2019Build}
-	case v1alpha1.AMIFamilyWindows2022:
-		return &Windows{Options: options, Version: v1alpha1.Windows2022, Build: v1alpha1.Windows2022Build}
-	case v1alpha1.AMIFamilyCustom:
+	case v1.AMIFamilyWindows2019:
+		return &Windows{Options: options, Version: v1.Windows2019, Build: v1.Windows2019Build}
+	case v1.AMIFamilyWindows2022:
+		return &Windows{Options: options, Version: v1.Windows2022, Build: v1.Windows2022Build}
+	case v1.AMIFamilyCustom:
 		return &Custom{Options: options}
+	case v1.AMIFamilyAL2023:
+		return &AL2023{Options: options}
 	default:
 		return &AL2{Options: options}
 	}
 }
 
-func (o Options) DefaultMetadataOptions() *v1alpha1.MetadataOptions {
-	return &v1alpha1.MetadataOptions{
-		HTTPEndpoint:            aws.String(ec2.LaunchTemplateInstanceMetadataEndpointStateEnabled),
-		HTTPProtocolIPv6:        aws.String(lo.Ternary(o.KubeDNSIP == nil || o.KubeDNSIP.To4() != nil, ec2.LaunchTemplateInstanceMetadataProtocolIpv6Disabled, ec2.LaunchTemplateInstanceMetadataProtocolIpv6Enabled)),
+func (o Options) DefaultMetadataOptions() *v1.MetadataOptions {
+	return &v1.MetadataOptions{
+		HTTPEndpoint:            aws.String(string(ec2types.InstanceMetadataEndpointStateDisabled)),
+		HTTPProtocolIPv6:        aws.String(lo.Ternary(o.KubeDNSIP == nil || o.KubeDNSIP.To4() != nil, string(ec2types.LaunchTemplateInstanceMetadataProtocolIpv6Disabled), string(ec2types.LaunchTemplateInstanceMetadataProtocolIpv6Enabled))),
 		HTTPPutResponseHopLimit: aws.Int64(2),
-		HTTPTokens:              aws.String(ec2.LaunchTemplateHttpTokensStateRequired),
+		HTTPTokens:              aws.String(string(ec2types.LaunchTemplateHttpTokensStateRequired)),
 	}
 }
 
-func (r Resolver) defaultClusterDNS(opts *Options, kubeletConfig *v1alpha5.KubeletConfiguration) *v1alpha5.KubeletConfiguration {
+func (r DefaultResolver) defaultClusterDNS(opts *Options, kubeletConfig *v1.KubeletConfiguration) *v1.KubeletConfiguration {
 	if opts.KubeDNSIP == nil {
 		return kubeletConfig
 	}
@@ -208,11 +210,81 @@ func (r Resolver) defaultClusterDNS(opts *Options, kubeletConfig *v1alpha5.Kubel
 		return kubeletConfig
 	}
 	if kubeletConfig == nil {
-		return &v1alpha5.KubeletConfiguration{
+		return &v1.KubeletConfiguration{
 			ClusterDNS: []string{opts.KubeDNSIP.String()},
 		}
 	}
 	newKubeletConfig := kubeletConfig.DeepCopy()
 	newKubeletConfig.ClusterDNS = []string{opts.KubeDNSIP.String()}
 	return newKubeletConfig
+}
+
+func (r DefaultResolver) resolveLaunchTemplates(
+	nodeClass *v1.EC2NodeClass,
+	nodeClaim *karpv1.NodeClaim,
+	instanceTypes []*cloudprovider.InstanceType,
+	capacityType string,
+	amiFamily AMIFamily,
+	amiID string,
+	maxPods int,
+	efaCount int,
+	capacityReservationIDs []string,
+	options *Options,
+) []*LaunchTemplate {
+	kubeletConfig := &v1.KubeletConfiguration{}
+	if nodeClass.Spec.Kubelet != nil {
+		kubeletConfig = nodeClass.Spec.Kubelet.DeepCopy()
+	}
+	if kubeletConfig.MaxPods == nil {
+		// nolint:gosec
+		// We know that it's not possible to have values that would overflow int32 here since we control
+		// the maxPods values that we pass in here
+		kubeletConfig.MaxPods = lo.ToPtr(int32(maxPods))
+	}
+	taints := lo.Flatten([][]corev1.Taint{
+		nodeClaim.Spec.Taints,
+		nodeClaim.Spec.StartupTaints,
+	})
+	if _, found := lo.Find(taints, func(t corev1.Taint) bool {
+		return t.MatchTaint(&karpv1.UnregisteredNoExecuteTaint)
+	}); !found {
+		taints = append(taints, karpv1.UnregisteredNoExecuteTaint)
+	}
+	// If no reservation IDs are provided, insert an empty string so the end result is a single launch template with no
+	// associated capacity reservation.
+	// TODO: We can simplify this by creating an initial lt, and then copying it for each cr. However, this requires a deep
+	// copy of the LT struct, which contains an interface causing problems for deepcopy-gen. See review comment for context:
+	// https://github.com/aws/karpenter-provider-aws/pull/7726#discussion_r1955280055
+	if len(capacityReservationIDs) == 0 {
+		capacityReservationIDs = append(capacityReservationIDs, "")
+	}
+	return lo.Map(capacityReservationIDs, func(id string, _ int) *LaunchTemplate {
+		resolved := &LaunchTemplate{
+			Options: options,
+			UserData: amiFamily.UserData(
+				r.defaultClusterDNS(options, kubeletConfig),
+				taints,
+				options.Labels,
+				options.CABundle,
+				instanceTypes,
+				nodeClass.Spec.UserData,
+				options.InstanceStorePolicy,
+			),
+			BlockDeviceMappings:   nodeClass.Spec.BlockDeviceMappings,
+			MetadataOptions:       nodeClass.Spec.MetadataOptions,
+			DetailedMonitoring:    aws.ToBool(nodeClass.Spec.DetailedMonitoring),
+			AMIID:                 amiID,
+			InstanceTypes:         instanceTypes,
+			EFACount:              efaCount,
+			CapacityType:          capacityType,
+			CapacityReservationID: id,
+		}
+		if len(resolved.BlockDeviceMappings) == 0 {
+			resolved.BlockDeviceMappings = amiFamily.DefaultBlockDeviceMappings()
+		}
+		if resolved.MetadataOptions == nil {
+			resolved.MetadataOptions = amiFamily.DefaultMetadataOptions()
+		}
+		return resolved
+	})
 }
